@@ -1,0 +1,675 @@
+---
+title: "CHD1 R616Q/+ NPC RNA-seq analysis"
+author: "Kimberley Jade Anderson"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 7,
+  fig.height = 5
+)
+```
+
+# Aim
+
+This R Markdown contains the RNA-seq analysis for female mouse NPCs derived from wild-type and `Chd1R616Q/+` embryos. It includes only the analyses needed for the missense model gene-expression results in the manuscript, excluding the RNA-seq variant and mutational signature analyses.
+
+The main outputs are:
+
+- differential expression analysis for `Chd1+/+` vs `Chd1R616Q/+` NPCs under DMSO/control conditions;
+- sample-level QC plots;
+- p-value and FDRtool correction checks;
+- export of differential expression tables;
+- top p-value decile gene list for enrichment analysis;
+- normalized expression plots for oxytocin pathway genes;
+- gene-length analysis by p-value decile.
+
+### First QC
+
+```{bash, eval=FALSE}
+#Entering every folder and running fastqc on every pair of fastq files
+find . -maxdepth 1 -mindepth 1 -type d -exec sh -c "cd '{}' && 
+    pwd && 
+    fastqc *.fq.gz -t 90  \;
+```
+
+
+### Ran Kallisto on every file for pseudoalignment
+
+```{bash, eval=FALSE}
+#Script to run kallisto on everything
+find . -maxdepth 1 -mindepth 1 -type d -exec sh -c "cd '{}' && pwd && kallisto quant -i /hpcdata/Mimir/kimberl/mm39_ncRNA_cDNA.idx -o '{$1}'_20230102_Kallisto -b 100 -t 48 *_1.fq.gz *_2.fq.gz" \;
+```
+
+
+
+### Libraries
+
+```{r libraries}
+library(DESeq2)
+library(tximport)
+library(TxDb.Mmusculus.UCSC.mm10.ensGene)
+library(EnsDb.Mmusculus.v79)
+library(ensembldb)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(kableExtra)
+library(fdrtool)
+library(pheatmap)
+library(RColorBrewer)
+library(GenomicRanges)
+library(GeneOverlap)
+```
+
+# Input files and sample metadata
+
+This analysis assumes that Kallisto outputs are stored in one directory per sample, each containing an `abundance.h5` file.
+
+Expected files:
+
+- `Kallisto_files_CHD1_DHT/<sample>/abundance.h5`
+- `samplesheet_final.csv`
+- optional: `temp_mNPC_all_detected_genes_DEseq.csv`, for the unrelated RNA-seq dataset used in the gene-length comparison.
+
+The sample sheet should contain at least:
+
+- `samples`
+- `treatment`
+- `genotype`
+
+For this missense model analysis, only DMSO/control samples are used.
+
+## Imported kallisto abundance files into R
+
+```{r input-files}
+kallisto_dir <- "Kallisto_files_CHD1_DHT"
+sample_sheet_file <- "samplesheet_final.csv"
+
+sample.sheet <- read.csv(sample_sheet_file)
+
+sample.sheet <- sample.sheet %>%
+  mutate(
+    embryo = substr(samples, start = 2, stop = 7),
+    embryo = factor(embryo),
+    genotype = factor(genotype),
+    treatment = factor(treatment)
+  )
+
+sample.sheet.genotype <- sample.sheet %>%
+  filter(treatment == "DMSO") %>%
+  droplevels()
+
+files.genotype <- file.path(kallisto_dir, sample.sheet.genotype$samples, "abundance.h5")
+names(files.genotype) <- sample.sheet.genotype$samples
+
+stopifnot(all(file.exists(files.genotype)))
+
+sample.sheet.genotype
+```
+
+# Transcript-to-gene annotation
+
+```{r tx2gene}
+txdb <- TxDb.Mmusculus.UCSC.mm10.ensGene
+transcript_ids <- ensembldb::keys(txdb, keytype = "TXNAME")
+tx2gene <- ensembldb::select(txdb, transcript_ids, "GENEID", "TXNAME")
+```
+
+# Import Kallisto abundance files
+
+```{r tximport}
+txi.genotype <- tximport(
+  files.genotype,
+  type = "kallisto",
+  tx2gene = tx2gene,
+  ignoreTxVersion = TRUE
+)
+```
+
+# Differential expression analysis
+
+The comparison is `Chd1+/+` vs `Chd1R616Q/+` in DMSO/control-treated female NPCs.
+
+```{r deseq2}
+dds.genotype <- DESeqDataSetFromTximport(
+  txi.genotype,
+  colData = sample.sheet.genotype,
+  design = ~ genotype
+)
+
+keep <- rowSums(counts(dds.genotype)) >= 10
+dds.genotype <- dds.genotype[keep, ]
+
+dds.genotype$genotype <- relevel(dds.genotype$genotype, ref = "Chd1+/+")
+
+dds.genotype <- DESeq(dds.genotype)
+resultsNames(dds.genotype)
+
+res.genotype <- results(dds.genotype)
+summary(res.genotype)
+```
+
+# Annotate genes
+
+```{r annotate-results}
+res.genotype <- as.data.frame(res.genotype)
+res.genotype$gene_id <- rownames(res.genotype)
+
+gene.annotation <- ensembldb::select(
+  EnsDb.Mmusculus.v79,
+  keys = res.genotype$gene_id,
+  keytype = "GENEID",
+  columns = c("GENEID", "SYMBOL")
+)
+
+res.genotype <- res.genotype %>%
+  left_join(gene.annotation, by = c("gene_id" = "GENEID")) %>%
+  rename(gene = SYMBOL) %>%
+  filter(!is.na(gene)) %>%
+  arrange(padj)
+
+res.genotype.sig <- res.genotype %>%
+  filter(!is.na(padj), padj <= 0.1)
+
+nrow(res.genotype.sig)
+```
+
+# Normalized counts table
+
+```{r normalized-counts}
+normalized.counts <- counts(dds.genotype, normalized = TRUE) %>%
+  as.data.frame()
+
+normalized.counts$gene_id <- rownames(normalized.counts)
+
+normalized.counts <- normalized.counts %>%
+  left_join(gene.annotation, by = c("gene_id" = "GENEID")) %>%
+  rename(gene = SYMBOL) %>%
+  filter(!is.na(gene))
+
+res.genotype.all <- res.genotype %>%
+  left_join(normalized.counts, by = c("gene", "gene_id")) %>%
+  arrange(padj)
+```
+
+# Quality control
+
+## PCA
+
+```{r pca}
+vsd.genotype <- vst(dds.genotype, blind = FALSE)
+plotPCA(vsd.genotype, intgroup = c("genotype"))
+```
+
+## Sample distance heatmap
+
+```{r sample-distance-heatmap}
+sample.dists <- dist(t(assay(vsd.genotype)))
+sample.dist.matrix <- as.matrix(sample.dists)
+
+rownames(sample.dist.matrix) <- paste(vsd.genotype$genotype, vsd.genotype$embryo, sep = "-")
+colnames(sample.dist.matrix) <- rownames(sample.dist.matrix)
+
+heatmap.colors <- colorRampPalette(rev(brewer.pal(9, "Blues")))(255)
+
+pheatmap(
+  sample.dist.matrix,
+  clustering_distance_rows = sample.dists,
+  clustering_distance_cols = sample.dists,
+  col = heatmap.colors
+)
+```
+
+## MA plot
+
+```{r ma-plot}
+plotMA(results(dds.genotype), ylim = c(-6, 6), lwd = 1)
+```
+
+## Histogram of raw p-values
+
+```{r pvalue-histogram}
+ggplot(res.genotype, aes(x = pvalue)) +
+  geom_histogram(bins = 100, boundary = 0) +
+  theme_classic() +
+  labs(
+    title = "Histogram of p-values: Chd1+/+ vs Chd1R616Q/+",
+    x = "p-value",
+    y = "Number of genes"
+  )
+```
+
+# FDRtool correction
+
+This section reproduces the corrected p-values and q-values used for ranking genes in the original analysis.
+
+```{r fdrtool-correction}
+res.genotype.filtered <- res.genotype %>%
+  filter(!is.na(pvalue), !is.na(padj), !is.na(stat))
+
+corrected.genotype <- fdrtool(
+  res.genotype.filtered$stat,
+  statistic = "normal",
+  plot = TRUE
+)
+
+corrected.genotype <- as.data.frame(corrected.genotype)
+corrected.genotype$gene_id <- res.genotype.filtered$gene_id
+
+res.genotype.filtered <- res.genotype.filtered %>%
+  left_join(
+    corrected.genotype %>% select(gene_id, cor.pval = pval, cor.qval = qval),
+    by = "gene_id"
+  ) %>%
+  arrange(cor.pval)
+
+res.genotype.all <- res.genotype.all %>%
+  left_join(
+    res.genotype.filtered %>% select(gene_id, cor.pval, cor.qval),
+    by = "gene_id"
+  ) %>%
+  arrange(cor.pval)
+```
+
+```{r corrected-pvalue-histogram}
+ggplot(res.genotype.filtered, aes(x = cor.pval)) +
+  geom_histogram(bins = 100, boundary = 0) +
+  theme_classic() +
+  labs(
+    title = "Corrected p-value histogram: Chd1+/+ vs Chd1R616Q/+",
+    x = "corrected p-value",
+    y = "Number of genes"
+  )
+```
+
+# Export differential expression tables
+
+```{r export-de-tables}
+write.csv(
+  res.genotype.all,
+  "20231116_Chd1_NPC_genotype_DEGs_all.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  res.genotype.all %>% filter(!is.na(cor.qval), cor.qval < 0.1),
+  "20231116_Chd1_NPC_genotype_DEGs_corqval_0.1.csv",
+  row.names = FALSE
+)
+```
+
+# Table of top genes
+
+```{r top-deg-table}
+res.genotype.all %>%
+  select(gene, baseMean, log2FoldChange, lfcSE, stat, pvalue, padj, cor.pval, cor.qval) %>%
+  slice_head(n = 20) %>%
+  mutate(across(where(is.numeric), ~ signif(.x, 3))) %>%
+  kable(format = "html", caption = "Top genes ranked by FDRtool-corrected p-value") %>%
+  kable_styling(full_width = FALSE)
+```
+
+# Top p-value decile genes
+
+The manuscript used the genes with the top 10% most significant p-values to avoid missing biologically relevant changes when the stringent DEG list was modest.
+
+```{r top-decile}
+res.genotype.all <- res.genotype.all %>%
+  filter(!is.na(cor.pval)) %>%
+  mutate(pval.decile = ntile(cor.pval, 10))
+
+genotype.top.decile <- res.genotype.all %>%
+  filter(pval.decile == 1) %>%
+  arrange(cor.pval)
+
+nrow(genotype.top.decile)
+range(genotype.top.decile$cor.pval, na.rm = TRUE)
+
+write.csv(
+  genotype.top.decile,
+  "20231116_Chd1_NPC_genotype_top_pvalue_decile.csv",
+  row.names = FALSE
+)
+```
+
+# Enrichment analysis input
+
+The exported top-decile gene list can be used for GO/KEGG overrepresentation analysis using a tool such as Metascape, clusterProfiler, WebGestalt, or g:Profiler.
+
+```{r export-enrichment-list}
+write.table(
+  genotype.top.decile$gene,
+  "20231116_Chd1_NPC_genotype_top_pvalue_decile_genes.txt",
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE
+)
+```
+
+# Oxytocin pathway genes
+
+Genes plotted for the oxytocin signaling pathway:
+
+- `Oxtr`
+- `Gnaq`
+- `Ptgs2`
+- `Prkcg`
+- `Rhoa`
+- `Eef2k`
+
+```{r plot-counts-function}
+# Use gene symbols as rownames for plotCounts.
+dds.symbol <- dds.genotype
+symbol.map <- gene.annotation$SYMBOL[match(rownames(dds.symbol), gene.annotation$GENEID)]
+keep.symbol <- !is.na(symbol.map) & !duplicated(symbol.map)
+dds.symbol <- dds.symbol[keep.symbol, ]
+rownames(dds.symbol) <- symbol.map[keep.symbol]
+
+plot_counts_for_gene <- function(gene) {
+  plotCounts(
+    dds.symbol,
+    gene = gene,
+    intgroup = c("genotype"),
+    returnData = TRUE
+  ) %>%
+    mutate(gene = gene)
+}
+```
+
+```{r oxytocin-pathway-plot}
+oxytocin.genes <- c("Oxtr", "Gnaq", "Ptgs2", "Prkcg", "Rhoa", "Eef2k")
+
+oxytocin.counts <- bind_rows(lapply(oxytocin.genes, plot_counts_for_gene))
+oxytocin.counts$gene <- factor(oxytocin.counts$gene, levels = oxytocin.genes)
+
+ggplot(oxytocin.counts, aes(x = genotype, y = count, colour = genotype)) +
+  geom_point(position = position_jitter(width = 0.12, height = 0), size = 2) +
+  facet_wrap(~ gene, scales = "free_y") +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(face = "italic"),
+    axis.text.x = element_text(face = "italic")
+  ) +
+  labs(
+    x = NULL,
+    y = "Normalized counts"
+  )
+```
+
+# Gene-length analysis
+
+This analysis tests whether genes in the most significant p-value decile are longer than the remaining detected genes.
+
+```{r gene-lengths}
+
+mouse.genes <- genes(txdb) %>%
+  as.data.frame()
+
+# Remove duplicate column names, if present
+mouse.genes <- mouse.genes[, !duplicated(names(mouse.genes))]
+
+# Rename the TxDb width column
+mouse.genes <- mouse.genes %>%
+  dplyr::rename(gene_width = width)
+
+# Add Ensembl gene IDs and gene symbols
+mouse.genes$gene_id <- rownames(mouse.genes)
+
+mouse.genes$gene <- gene.annotation$SYMBOL[
+  match(mouse.genes$gene_id, gene.annotation$GENEID)
+]
+
+# Join gene lengths to the genotype DESeq2 results
+res.length <- res.genotype.all %>%
+  dplyr::left_join(
+    mouse.genes %>% dplyr::select(gene, gene_width),
+    by = "gene"
+  ) %>%
+  dplyr::filter(!is.na(gene_width), !is.na(cor.pval)) %>%
+  dplyr::mutate(
+    pval.decile = dplyr::ntile(cor.pval, 10),
+    pval.group = ifelse(pval.decile == 1, "Top decile", "Other detected genes")
+  )
+```
+
+```{r average-gene-length-by-decile}
+gene.length.summary <- res.length %>%
+  dplyr::group_by(pval.decile) %>%
+  dplyr::summarise(
+    mean_length = mean(gene_width, na.rm = TRUE),
+    median_length = median(gene_width, na.rm = TRUE),
+    n = dplyr::n(),
+    .groups = "drop"
+  )
+
+gene.length.summary
+
+write.csv(
+  gene.length.summary,
+  "20231116_Chd1_NPC_genotype_gene_length_by_pvalue_decile.csv",
+  row.names = FALSE
+)
+```
+
+```{r gene-length-decile-plot}
+ggplot(gene.length.summary, aes(x = factor(pval.decile), y = mean_length)) +
+  geom_point(size = 3) +
+  theme_classic() +
+  labs(
+    x = "p-value decile",
+    y = "Average gene length",
+    title = "Average gene length by p-value decile"
+  )
+```
+
+```{r gene-length-statistics}
+group.top <- res.length$gene_width[
+  res.length$pval.group == "Top decile"
+]
+
+group.other <- res.length$gene_width[
+  res.length$pval.group == "Other detected genes"
+]
+
+gene.length.test <- t.test(group.top, group.other, var.equal = FALSE)
+gene.length.test
+
+eta2 <- gene.length.test$statistic^2 /
+  (gene.length.test$statistic^2 + gene.length.test$parameter)
+
+cohens.d <- 2 * sqrt(eta2 / (1 - eta2))
+cohens.d
+```
+
+# Comparison with unrelated NPC RNA-seq dataset
+
+This section is optional and only runs if the file `temp_mNPC_all_detected_genes_DEseq.csv` is present.
+
+```{r unrelated-dataset-gene-length, eval=file.exists("temp_mNPC_all_detected_genes_DEseq.csv")}
+temp <- read.csv("temp_mNPC_all_detected_genes_DEseq.csv")
+
+# Expected columns include gene and pvalue.
+temp <- temp %>%
+  dplyr::rename(cor.pval = pvalue) %>%
+  dplyr::left_join(
+    mouse.genes %>% dplyr::select(gene, gene_width),
+    by = "gene"
+  ) %>%
+  dplyr::filter(!is.na(gene_width), !is.na(cor.pval)) %>%
+  dplyr::mutate(
+    pval.decile = dplyr::ntile(cor.pval, 10),
+    pval.group = ifelse(pval.decile == 1, "Top decile", "Other detected genes")
+  )
+
+temp.length.summary <- temp %>%
+  dplyr::group_by(pval.decile) %>%
+  dplyr::summarise(
+    mean_length = mean(gene_width, na.rm = TRUE),
+    median_length = median(gene_width, na.rm = TRUE),
+    n = dplyr::n(),
+    .groups = "drop"
+  )
+
+combined.length.summary <- dplyr::bind_rows(
+  gene.length.summary %>%
+    dplyr::mutate(dataset = "Chd1+/+ vs Chd1R616Q/+"),
+  temp.length.summary %>%
+    dplyr::mutate(dataset = "Unrelated NPC dataset")
+)
+
+ggplot(combined.length.summary, aes(
+  x = factor(pval.decile),
+  y = mean_length,
+  colour = dataset
+)) +
+  geom_point(size = 3) +
+  theme_classic() +
+  labs(
+    x = "p-value decile",
+    y = "Average gene length",
+    title = "Gene length by p-value decile"
+  )
+
+temp.test <- t.test(
+  temp$gene_width[temp$pval.group == "Top decile"],
+  temp$gene_width[temp$pval.group == "Other detected genes"],
+  var.equal = FALSE
+)
+
+temp.test
+
+eta2.temp <- temp.test$statistic^2 /
+  (temp.test$statistic^2 + temp.test$parameter)
+
+cohens.d.temp <- 2 * sqrt(eta2.temp / (1 - eta2.temp))
+cohens.d.temp
+```
+
+# Re-plotting webGestalt results
+
+```{r}
+library(stringr)
+
+webGestaltPlot <- function(webgestalt_results) {
+    # Function to capitalize the first letter of each category
+    capitalize_first <- function(x) {
+      str_to_title(x)  # Converts only the first letter to uppercase
+    }
+    # Sort data by enrichmentRatio for better visualization
+    # Transform data
+    webgestalt_results <- webgestalt_results %>%
+      arrange(enrichmentRatio) %>%  # Sort by enrichment for better order
+      mutate(
+        description = factor(capitalize_first(description), 
+                             levels = capitalize_first(description)),  # Capitalize first letter
+        logFDR = -log10(FDR)  # Transform FDR for better scaling
+      )
+    # Ensure min and max are different
+    min_overlap <- floor(min(webgestalt_results$overlap) / 10) * 10  
+    # Round down to nearest 10
+    max_overlap <- ceiling(max(webgestalt_results$overlap) / 10) * 10  
+    # Round up to nearest 10
+
+    # If min and max are the same, add +10 to max to ensure at least two breakpoints
+    if (min_overlap == max_overlap) {
+      max_overlap <- min_overlap + 10
+    }
+    limit_values <- c(
+        floor(min(webgestalt_results$overlap) / 10) * 10,  
+        # Round down to nearest 10
+        ceiling(max(webgestalt_results$overlap) / 10) * 10  
+        # Round up to nearest 10
+        )
+
+    # Create dot plot
+    wgp <-ggplot(webgestalt_results, aes(x = enrichmentRatio, y = description)) +
+    
+      # Add lines connecting labels to dots
+      geom_segment(aes(xend = 0, yend = description), 
+                   color = "gray70", size = 0.5) +
+    
+      # Add dots with new aesthetics
+      geom_point(aes(size = logFDR, color = overlap)) +
+    
+      # Define color scale from white to dark blue
+      scale_color_gradient(low = "grey", high = "darkblue", 
+                           name = "Overlapping Genes",
+                           #breaks = break_values,  
+                           # Ensures values like 10, 20, 30...
+                           #labels = c(break_values)  
+                           # Forces whole numbers
+                           limits = limit_values
+                           ) +
+      # Adjust size scale to reduce dramatic size differences
+      scale_size_continuous(range = c(3, 7), name = "-log10(FDR)") +  # Adjust min/max size
+      # Remove gridlines and improve appearance
+      theme_minimal() +
+      theme(
+        panel.grid.major = element_blank(),  # Remove major gridlines
+        panel.grid.minor = element_blank(),  # Remove minor gridlines
+        axis.text.y = element_text(size = 10),  # Improve y-axis text readability
+        axis.text.x = element_text(size = 10, colour = "black"),
+        legend.position = "right"
+      ) +
+      
+      theme(
+        axis.line.x = element_line(color = "gray50", size = 0.5),
+        axis.line.y = element_line(color = "gray50", size = 0.5),
+        axis.ticks.x = element_line(color = "gray50", 
+                                    size = 0.3),  # Small gray tick marks on x-axis
+        axis.ticks.length.x = unit(3, "pt")  # Adjust tick length (smaller ticks)
+      ) +
+    
+      # Improve labels
+     # labs(
+      #  x = "Enrichment Score (Ratio)",
+       # y = "Functional Category",
+        #title = "WebGestalt Over-Representation Analysis",
+      #  size = "-log10(FDR)"
+      #) +
+      
+     coord_cartesian(clip = "off")
+    return(wgp)
+}
+kegg_resGen <- read.delim("20231120_WebGestalt/Project_wg_result1724849897_KEGG_pathway_genotype_DEGs/enrichment_results_wg_result1724850072.txt",sep = "\t", header = TRUE)
+kegg_resGen_plot <- webGestaltPlot(kegg_resGen)
+kegg_resGen_plot
+ggsave(file = "Genotype_KEGG_OR_webGestalt.pdf", height = 3, width = 7, pointsize = 8, device = cairo_pdf)
+
+overlap_cellcomp <- read.delim("20231120_WebGestalt/Project_wg_result1700473070_Cell_compartment/enrichment_results_wg_result1700473070.txt",sep = "\t", header = TRUE)
+overlap_cellcomp_plot <- webGestaltPlot(overlap_cellcomp)
+overlap_cellcomp_plot
+ggsave(file = "Overlap_cellCompa_OR_webGestalt.pdf", height = 3, width = 5, pointsize = 8, device = cairo_pdf)
+
+cellComp_genotype <- read.delim("20231120_WebGestalt/Project_wg_result1724849278_Cell_component_genotypeDEGS_top10%/enrichment_results_wg_result1724849278.txt", sep = "\t", header = TRUE)
+cellComp_genotype_plot <- webGestaltPlot(cellComp_genotype)
+cellComp_genotype_plot
+ggsave(file = "Genotype_CellComp_OR_webGestalt.pdf", height = 3, width = 7, pointsize = 8, device = cairo_pdf)
+
+cellComp_DHT <- read.delim("20231120_WebGestalt/Project_wg_result1724849278_Cell_component_DHT_DEGS_top10%/enrichment_results_wg_result1724849822.txt",  sep = "\t", header = TRUE)
+cellComp_DHT_plot <- webGestaltPlot(cellComp_DHT)
+cellComp_DHT_plot
+ggsave(file = "DHT_CellComp_OR_webGestalt.pdf", height = 3, width = 5, pointsize = 8, device = cairo_pdf)
+
+KEGG_DHT <- read.delim("20231120_WebGestalt/Project_wg_result1724849897_KEGG_pathway_DHT_DEGs/enrichment_results_wg_result1724849897.txt", sep = "\t", header = TRUE)
+KEGG_DHT_plot <- webGestaltPlot(KEGG_DHT)
+KEGG_DHT_plot
+ggsave(file = "DHT_KEGG_OR_webGestalt.pdf", height = 2, width = 3.5, pointsize = 8, device = cairo_pdf)
+```
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,408 @@
+---
+title: "Chd1 RNAseq GATK variant"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Mutational signatures analysis of Chd1 RNAseq 
+
+This is using the RNAseq data from CHD1 WT and Chd1-R616Q E18.5 NPCs from our mouse model.
+
+### First, we aligned the RNAseq data to the genome using STAR 2 pass
+
+```{bash, eval = FALSE}
+#!/bin/sh
+
+#SBATCH --mail-type ALL
+#SBATCH --mail-user=kimberl@hi.is
+#SBATCH --job-name=STAR     # Job name
+#SBATCH --output=/hpcdata/Mimir/kimberl/logfiles/20241025/20241025_STAR2pass.out    # Output file (STDOUT)
+#SBATCH --error=/hpcdata/Mimir/kimberl/logfiles/20241025/202410025_STAR2pass.err   # Error file (STDERR)
+#SBATCH --partition=128cpu_256mem
+#SBATCH -N 1
+#SBATCH -n 128
+
+## ran with this command:  sbatch ...
+
+
+cd /proj/hpcdata/Mimir/kimberl/20230102_Novogene_RNAseq/CHD1_RNAseq
+
+find . -maxdepth 1 -mindepth 1 -type d -exec bash -c '
+    cd "$1" && pwd &&
+    name=$(basename "$PWD")
+    
+    # Check if there are *_1.fq.gz and *_2.fq.gz files
+    if ls *_1.fq.gz >/dev/null 2>&1 && ls *_2.fq.gz >/dev/null 2>&1; then
+        # Get comma-separated list of *_1.fq.gz files
+        r1_files=$(ls *_1.fq.gz | paste -sd "," -)
+        
+        # Get comma-separated list of *_2.fq.gz files
+        r2_files=$(ls *_2.fq.gz | paste -sd "," -)
+        
+        # Run STAR command with comma-separated lists of files
+        STAR --runThreadN 128 \
+        --genomeDir /proj/hpcdata/Mimir/kimberl/Genome_indexes/GRCm39_v112/STAR_index \
+        --sjdbGTFfile /proj/hpcdata/Mimir/kimberl/Genome_indexes/GRCm39_v112/Mus_musculus.GRCm39.112.chr.gtf \
+        --readFilesIn "$r1_files" "$r2_files" \
+        --readFilesCommand zcat \
+        --outWigType wiggle \
+        --twopassMode Basic \
+        --outFileNamePrefix 20241024_STAR_2pass/"${name}_STAR" \
+        --outSAMtype BAM SortedByCoordinate
+    else
+        echo "Skipping $name: Missing *_1.fq.gz or *_2.fq.gz files."
+    fi
+' bash {} \;
+
+```
+
+### Running GATK
+
+```{bash, eval = FALSE}
+#!/bin/sh
+
+#SBATCH --job-name=gatk     # Job name
+#SBATCH --mail-type ALL
+#SBATCH --mail-user=kimberl@hi.is
+#SBATCH --output=/hpcdata/Mimir/kimberl/logfiles/20241029/20241029_GATK_h.out    # Output file (STDOUT)
+#SBATCH --error=/hpcdata/Mimir/kimberl/logfiles/20241029/20241029_GATK_h.err   # Error file (STDERR)
+#SBATCH --partition=48cpu_192mem
+#SBATCH -N 3
+#SBATCH -n 144
+
+ml use /hpcapps/libsci-gcc/modules/all
+ml use /hpcapps/lib-mimir/modules/all
+ml use /hpcapps/libbio-gpu/modules/all
+
+
+ml load Java/15.0.1 
+ml load picard
+
+# Loop over each .bam file in the folder
+for input_file in *.sortedByCoord.out.bam; do
+    # Define output file by appending "_filtered" to the original filename
+    output_file="${input_file%.sortedByCoord.out.bam}_out"
+
+    java -jar $EBROOTPICARD/picard.jar MarkDuplicates \
+        I="$input_file" \
+        O="$output_file"_marked_duplicates.bam \
+        M="$output_file"_marked_dup_metrics.txt \
+    
+    echo "Processed $input_file"
+done
+
+
+
+ml load  Java/17.0.6
+module load GATK/4.4.0.0-GCCcore-12.2.0-Java-17
+ml load SAMtools/1.17-GCC-11.2.0
+
+for input_file in *STARAligned_out_marked_duplicates.bam; do
+    # Define output file by appending "_filtered" to the original filename
+    output_file="${input_file%_STARAligned_out_marked_duplicates.bam}_out"
+
+    gatk SplitNCigarReads \
+        -R /proj/hpcdata/Mimir/kimberl/Genome_indexes/GRCm39_v112/Mus_musculus.GRCm39.dna.primary_assembly.fa \
+        -I "$input_file" \
+        -O "$output_file"_SplitNCigar_output.bam
+    done
+        
+for input_file in *_out_SplitNCigar_output.bam; do
+    # Define output file by appending "_filtered" to the original filename
+    output_file="${input_file%_out_SplitNCigar_output.bam}"
+    
+    samtools addreplacerg -r "ID:$output_file" -r 'LB:library1' -r 'PL:ILLUMINA' -r 'PU:unit1' -r "SM:$output_file" \
+    -o RG_"$output_file".bam "$input_file" -@ 144
+    samtools index RG_"$output_file".bam -@ 96
+
+    gatk BaseRecalibrator \
+        -I RG_"$output_file".bam \
+        -R /proj/hpcdata/Mimir/kimberl/Genome_indexes/GRCm39_v112/Mus_musculus.GRCm39.dna.primary_assembly.fa \
+        --known-sites /proj/hpcdata/Mimir/kimberl/Genome_indexes/GRCm39_v112/mus_musculus.vcf \
+        --use-original-qualities \
+        -O "$output_file"_recal_data.table
+
+     gatk ApplyBQSR \
+        -R /proj/hpcdata/Mimir/kimberl/Genome_indexes/GRCm39_v112/Mus_musculus.GRCm39.dna.primary_assembly.fa \
+        -I RG_"$output_file".bam \
+        --bqsr-recal-file "$output_file"_recal_data.table \
+        --add-output-sam-program-record \
+        --use-original-qualities \
+        -O "$output_file"_bsqr_output.bam
+
+    gatk AnalyzeCovariates \
+        -bqsr "$output_file"_recal_data.table \
+        -plots "$output_file"_AnalyzeCovariates.pdf
+
+    
+    done
+
+# Step 1. Run Mutect2 in tumor-only mode for each normal sample.
+
+gatk Mutect2 -R /proj/hpcdata/Mimir/kimberl/Genome_indexes/GRCm39_v112/Mus_musculus.GRCm39.dna.primary_assembly.fa \
+    -I A1470_3_DMSO_bsqr_output.bam \
+    -max-mnp-distance 0 \
+    --native-pair-hmm-threads 144 \
+    -O normal1.vcf.gz
+
+gatk Mutect2 -R /proj/hpcdata/Mimir/kimberl/Genome_indexes/GRCm39_v112/Mus_musculus.GRCm39.dna.primary_assembly.fa \
+    -I A1470_4_DMSO_bsqr_output.bam \
+    -max-mnp-distance 0 \
+    --native-pair-hmm-threads 144 \
+    -O normal2.vcf.gz
+
+gatk Mutect2 -R /proj/hpcdata/Mimir/kimberl/Genome_indexes/GRCm39_v112/Mus_musculus.GRCm39.dna.primary_assembly.fa \
+    -I A2288_6_DMSO_bsqr_output.bam \
+    -max-mnp-distance 0 \
+    --native-pair-hmm-threads 144 \
+    -O normal3.vcf.gz
+
+gatk Mutect2 -R /proj/hpcdata/Mimir/kimberl/Genome_indexes/GRCm39_v112/Mus_musculus.GRCm39.dna.primary_assembly.fa \
+    -I A2288_8_DMSO_bsqr_output.bam \
+    -max-mnp-distance 0 \
+    --native-pair-hmm-threads 144 \
+    -O normal4.vcf.gz
+
+# Step 2. Create a GenomicsDB from the normal Mutect2 calls.
+
+gatk GenomicsDBImport -R /proj/hpcdata/Mimir/kimberl/Genome_indexes/GRCm39_v112/Mus_musculus.GRCm39.dna.primary_assembly.fa \
+        --genomicsdb-workspace-path pon_db \
+        -L /proj/hpcdata/Mimir/kimberl/Genome_indexes/GRCm39_v112/Mus_musculus.GRCm39_intervals.list \
+        -V normal1.vcf.gz \
+        -V normal2.vcf.gz \
+        -V normal3.vcf.gz \
+        -V normal4.vcf.gz
+
+# Create panel of normals.
+
+ gatk CreateSomaticPanelOfNormals -R /proj/hpcdata/Mimir/kimberl/Genome_indexes/GRCm39_v112/Mus_musculus.GRCm39.dna.primary_assembly.fa \
+     -V gendb://pon_db -O pon.vcf.gz
+
+
+# Now call variants using the panel of normals and the germline resource
+for input_file in *_bsqr_output.bam; do
+    
+    file_name=$(basename "$input_file")
+    name="${file_name%_bsqr_output.bam}"
+    
+    gatk Mutect2 \
+    -R /proj/hpcdata/Mimir/kimberl/Genome_indexes/GRCm39_v112/Mus_musculus.GRCm39.dna.primary_assembly.fa \
+    -I "$input_file" \
+    --germline-resource /proj/hpcdata/Mimir/kimberl/Genome_indexes/GRCm39_v112/mus_musculus.vcf \
+    --panel-of-normals pon.vcf.gz \
+    --native-pair-hmm-threads 144 \
+    -O "$name"_vs_PoN.vcf.gz
+
+done
+```
+
+### Filtering vcf files using bcftools isec to remove variants that are present in at least 12 of the 16 samples
+```{bash, eval=FALSE}
+
+#!/bin/sh
+
+#SBATCH --job-name=gatk     # Job name
+#SBATCH --mail-type ALL
+#SBATCH --mail-user=kimberl@hi.is
+#SBATCH --output=/hpcdata/Mimir/kimberl/logfiles/20241105/20241105.out   # Output file (STDOUT)
+#SBATCH --error=/hpcdata/Mimir/kimberl/logfiles/20241105/20241105.err  # Error file (STDERR)
+#SBATCH --partition=48cpu_192mem
+#SBATCH -N 2
+#SBATCH -n 96
+
+ml use /hpcapps/libsci-gcc/modules/all
+ml use /hpcapps/lib-mimir/modules/all
+ml use /hpcapps/libbio-gpu/modules/all
+
+ml load  BCFtools/1.17-GCC-11.2.0
+
+# Start by merging all vcf files to find the common variants. This will be made in the site.vcf.txt file
+bcftools isec -p 20241105_filtered_output/ -n +12 -c all -Oz *.vcf.gz
+
+
+# Now Filter each VCF file in a loop
+for vcf in *.vcf.gz; do
+    bcftools view -T ^20241105_filtered_output/sites.txt $vcf -Oz -o filtered_${vcf}
+    bcftools index filtered_${vcf}
+done
+```
+
+## RNAseq variant analysis after GATK
+
+```{r variants, warning=FALSE, cache=TRUE}
+library(tidyverse)
+library(MutationalPatterns)
+library(BSgenome.Mmusculus.UCSC.mm39)
+library(GenomicRanges)
+library(TxDb.Mmusculus.UCSC.mm39.refGene)
+library(NMF)
+
+bsGenome <- BSgenome.Mmusculus.UCSC.mm39
+txdb <- TxDb.Mmusculus.UCSC.mm39.refGene
+
+# Read filtered VCF files
+pattern <- "\\.vcf\\.gz$|\\.vcf$"
+
+vcf_files <- list.files(
+  path = "STAR_2pass_vcf/Filtered/",
+  pattern = pattern,
+  full.names = TRUE
+)
+
+filenames <- basename(vcf_files)
+filenames <- sub("\\..*$", "", filenames)
+
+# Read indels and SNVs separately
+indels <- read_vcfs_as_granges(
+  vcf_files,
+  sample_names = filenames,
+  genome = "BSgenome.Mmusculus.UCSC.mm39",
+  type = "indel"
+)
+
+snvs <- read_vcfs_as_granges(
+  vcf_files,
+  sample_names = filenames,
+  genome = "BSgenome.Mmusculus.UCSC.mm39",
+  type = "snv"
+)
+
+# Limit to exonic variants
+exons <- exons(txdb)
+
+indels_exonic <- lapply(indels, function(gr) subsetByOverlaps(gr, exons))
+snvs_exonic   <- lapply(snvs,   function(gr) subsetByOverlaps(gr, exons))
+
+# Count exonic indels and SNVs per sample
+indelnum <- sapply(indels_exonic, length)
+snvnum   <- sapply(snvs_exonic, length)
+
+write.csv2(data.frame(indelnum), "indelnum.csv")
+write.csv2(data.frame(snvnum), "SNVnum.csv")
+
+# Convert indels to GRangesList for MutationalPatterns
+indels_exonic <- GRangesList(indels_exonic)
+
+# Get indel contexts and counts
+indel_context <- get_indel_context(
+  indels_exonic,
+  ref_genome = "BSgenome.Mmusculus.UCSC.mm39"
+)
+
+indel_counts <- count_indel_contexts(indel_context)
+
+write.csv2(indel_counts, "indel_context.csv")
+
+# Fit exonic indel counts to known COSMIC indel signatures
+indel_counts1 <- indel_counts + 0.0001
+
+signatures <- get_known_signatures("indel", source = "COSMIC")
+
+fit_res <- fit_to_signatures(indel_counts1, signatures)
+
+write.csv(fit_res$contribution, "COSMIC_sig.csv")
+```
+
+## COSMIC indel signature statistical analysis
+
+```{r}
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+
+df_cosmic_all <- read.csv(
+  "COSMIC_sig.csv",
+  header = TRUE,
+  check.names = FALSE,
+  row.names = 1,
+  fileEncoding = "latin1"
+)
+
+genotype_map <- c(
+  "A1470_1" = "Chd1+/R616Q",
+  "A1470_3" = "Chd1+/+",
+  "A1470_4" = "Chd1+/+",
+  "A1470_5" = "Chd1+/R616Q",
+  "A2288_2" = "Chd1+/R616Q",
+  "A2288_5" = "Chd1+/R616Q",
+  "A2288_6" = "Chd1+/+",
+  "A2288_8" = "Chd1+/+"
+)
+
+df_cosmic_long <- df_cosmic_all %>%
+  rownames_to_column("Signature") %>%
+  pivot_longer(-Signature, names_to = "Sample", values_to = "Count") %>%
+  mutate(
+    sample_key = str_extract(Sample, "A\\d+_\\d+"),
+    Genotype = genotype_map[sample_key],
+    Treatment = ifelse(grepl("DHT", Sample), "DHT", "DMSO"),
+    Genotype = factor(Genotype, levels = c("Chd1+/+", "Chd1+/R616Q")),
+    Treatment = factor(Treatment, levels = c("DMSO", "DHT"))
+  )
+
+df_dmso <- df_cosmic_long %>%
+  filter(Treatment == "DMSO")
+
+signatures_all <- unique(df_cosmic_long$Signature)
+
+results_all <- do.call(rbind, lapply(signatures_all, function(sig) {
+  wt <- df_dmso$Count[df_dmso$Signature == sig & df_dmso$Genotype == "Chd1+/+"]
+  mut <- df_dmso$Count[df_dmso$Signature == sig & df_dmso$Genotype == "Chd1+/R616Q"]
+  
+  if (sd(c(wt, mut)) == 0 || length(wt) < 2 || length(mut) < 2) {
+    return(data.frame(
+      Signature = sig,
+      mean_WT = mean(wt),
+      mean_Mut = mean(mut),
+      t = NA,
+      df = NA,
+      p_raw = NA,
+      eta2 = NA
+    ))
+  }
+  
+  tt <- t.test(wt, mut, var.equal = FALSE)
+  eta2 <- tt$statistic^2 / (tt$statistic^2 + tt$parameter)
+  
+  data.frame(
+    Signature = sig,
+    mean_WT = round(mean(wt), 3),
+    mean_Mut = round(mean(mut), 3),
+    t = round(tt$statistic, 4),
+    df = round(tt$parameter, 3),
+    p_raw = round(tt$p.value, 6),
+    eta2 = round(eta2, 4)
+  )
+}))
+
+results_all <- results_all %>%
+  mutate(
+    p_holm = round(p.adjust(p_raw, method = "holm"), 6),
+    significant = p_holm < 0.05
+  ) %>%
+  arrange(p_raw)
+
+results_all %>%
+  mutate(
+    p_raw = signif(p_raw, 3),
+    p_holm = signif(p_holm, 3),
+    significant = ifelse(significant, "Yes", "No")
+  ) %>%
+  kable(
+    caption = "COSMIC indel signature comparison between Chd1+/+ and Chd1R616Q/+ DMSO samples",
+    digits = 3
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE
+  ) %>%
+  row_spec(which(results_all$significant), bold = TRUE)
+```
+
+
+
+
