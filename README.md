@@ -5,4 +5,4 @@ Here is the [index page](https://kimberleya.github.io/Androgens-mediate-sexual-d
 
 RNA-seq Analysis of the NPCs from the missense mouse model
 
-[Mutational signatures analysis of the above RNA-seq data](https://kimberleya.github.io/Androgens-mediate-sexual-dimorphism-in-Pilarowski-Bjornsson-Syndrome/20260625_mutational_analysis_RNA.html)
+[Mutational signatures analysis of the above RNA-seq data](https://kimberleya.github.io/Androgens-mediate-sexual-dimorphism-in-Pilarowski-Bjornsson-Syndrome/20260625_mutational_analysis_RNA.html){:target="_blank"}
