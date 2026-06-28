@@ -6,3 +6,7 @@ Here is the [index page](https://kimberleya.github.io/Androgens-mediate-sexual-d
 [RNA-seq Analysis of the NPCs from the missense mouse model](https://kimberleya.github.io/Androgens-mediate-sexual-dimorphism-in-Pilarowski-Bjornsson-Syndrome/CHD1_R616Q_NPC_RNAseq_analysis_clean.html)
 
 [Mutational signatures analysis of the above RNA-seq data](https://kimberleya.github.io/Androgens-mediate-sexual-dimorphism-in-Pilarowski-Bjornsson-Syndrome/20260625_mutational_analysis_RNA.html)
+
+[CUT&RUN analysis](https://kimberleya.github.io/Androgens-mediate-sexual-dimorphism-in-Pilarowski-Bjornsson-Syndrome/CHD1_CUTRUN_analysis_clean.html)
+
+[CUT&RUN motif analysis](https://kimberleya.github.io/Androgens-mediate-sexual-dimorphism-in-Pilarowski-Bjornsson-Syndrome/20260531_AME_CHD1_motif.html)
