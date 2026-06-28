@@ -10,3 +10,8 @@ Here is the [index page](https://kimberleya.github.io/Androgens-mediate-sexual-d
 [CUT&RUN analysis](https://kimberleya.github.io/Androgens-mediate-sexual-dimorphism-in-Pilarowski-Bjornsson-Syndrome/CHD1_CUTRUN_analysis_clean.html)
 
 [CUT&RUN motif analysis](https://kimberleya.github.io/Androgens-mediate-sexual-dimorphism-in-Pilarowski-Bjornsson-Syndrome/20260531_AME_CHD1_motif.html)
+
+[Chd1 KO NPC RNA-seq analysis](https://kimberleya.github.io/Androgens-mediate-sexual-dimorphism-in-Pilarowski-Bjornsson-Syndrome/CHD1_KO_RNAseq_manuscript_relevant_cleaned.html)
+
+[Statistical analysis of mouse and cell-based assays](https://kimberleya.github.io/Androgens-mediate-sexual-dimorphism-in-Pilarowski-Bjornsson-Syndrome/2026_CHD1_mouse_weight_and_related_stats.html)
+* Some of these are based on eta-squared values from Welch's t-tests that were performed in GraphPad prism.
