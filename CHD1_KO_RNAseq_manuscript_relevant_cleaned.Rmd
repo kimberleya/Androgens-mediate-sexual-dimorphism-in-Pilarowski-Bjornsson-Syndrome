@@ -1,0 +1,577 @@
+---
+title: "CHD1 KO RNA-seq analysis for PILBOS manuscript"
+author: "Kimberley Jade Anderson"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 5,
+  fig.height = 4
+)
+```
+
+# Overview
+
+This R Markdown contains only the CHD1 KO NPC RNA-seq analyses used for the manuscript section on androgen rescue of CHD1-deficiency-associated transcriptional changes.
+
+This script generates:
+
+- DESeq2 results for:
+  - CHD1 KO vs control, DMSO-treated NPCs
+  - DHT vs DMSO in CHD1 KO NPCs
+  - DHT + enzalutamide vs DHT in CHD1 KO NPCs
+  - DHT + enzalutamide vs DMSO in CHD1 KO NPCs
+- QC plots for the RNA-seq dataset
+- Gene lists for downstream interpretation
+- Log2FC correlation plots used for the DHT rescue and enzalutamide analyses
+- Correlation comparison statistics testing whether enzalutamide attenuates DHT rescue
+
+# Libraries
+
+```{r libraries}
+library(tidyverse)
+library(GenomicFeatures)
+library(tximport)
+library(DESeq2)
+library(EnsDb.Mmusculus.v79)
+library(psych)
+library(RColorBrewer)
+library(pheatmap)
+```
+
+# Import kallisto abundance files
+
+```{r import-kallisto, cache=TRUE}
+# Build TxDb from the same GTF used for kallisto
+txdb <- makeTxDbFromGFF(
+  "Mus_musculus.GRCm39.115.gtf/Mus_musculus.GRCm39.115.gtf",
+  format = "gtf"
+)
+
+tx_keys <- keys(txdb, keytype = "TXNAME")
+
+tx2gene <- AnnotationDbi::select(
+  txdb,
+  keys = tx_keys,
+  columns = "GENEID",
+  keytype = "TXNAME"
+)
+
+samples <- dir(path = "kallisto_output/", pattern = "_Kallisto")
+
+sample.sheet <- data.frame(samples = samples) %>%
+  mutate(
+    replicate = sub("^(A[0-9]+)_.*", "\\1", samples),
+    genotype = sub("^A[0-9]+_([^_]+)_.*", "\\1", samples),
+    treatment = sub("^A[0-9]+_[^_]+_([^_]+)_.*", "\\1", samples),
+    treatment = ifelse(grepl("D_E", samples), "D_E", treatment),
+    genotype = ifelse(grepl("CHD1", samples), "CHD1_KO", genotype),
+    group = factor(paste(genotype, treatment, sep = "_")),
+    replicate = factor(replicate)
+  )
+
+sample.sheet$group <- relevel(sample.sheet$group, ref = "CTL_DMSO")
+
+files <- file.path("kallisto_output", samples, "abundance.h5")
+names(files) <- sample.sheet$samples
+
+txi <- tximport(
+  files,
+  type = "kallisto",
+  tx2gene = tx2gene,
+  ignoreTxVersion = TRUE
+)
+```
+
+# DESeq2 analysis
+
+```{r deseq2, cache=TRUE}
+ddsTxi <- DESeqDataSetFromTximport(
+  txi,
+  colData = sample.sheet,
+  design = ~ replicate + group
+)
+
+# Keep genes expressed with count >= 2 in at least 3 samples in at least one group
+keep <- apply(counts(ddsTxi), 1, function(x) {
+  any(tapply(x >= 2, ddsTxi$group, sum) >= 3)
+})
+
+dds <- ddsTxi[keep, ]
+dds <- DESeq(dds)
+
+resultsNames(dds)
+
+# Main manuscript contrasts
+res_genotype <- results(
+  dds,
+  contrast = c("group", "CHD1_KO_DMSO", "CTL_DMSO")
+)
+
+res_KO_DHT_vs_DMSO <- results(
+  dds,
+  contrast = c("group", "CHD1_KO_DHT", "CHD1_KO_DMSO")
+)
+
+res_KO_DEnz_vs_DHT <- results(
+  dds,
+  contrast = c("group", "CHD1_KO_D_E", "CHD1_KO_DHT")
+)
+
+res_KO_DEnz_vs_DMSO <- results(
+  dds,
+  contrast = c("group", "CHD1_KO_D_E", "CHD1_KO_DMSO")
+)
+
+normalized.counts <- counts(dds, normalized = TRUE)
+colnames(normalized.counts) <- sample.sheet$samples
+```
+
+# RNA-seq QC
+
+```{r qc-plots}
+hist(
+  res_genotype$pvalue,
+  breaks = 100,
+  main = "Histogram of p-values: CHD1 KO vs control",
+  xlab = "p-value",
+  freq = FALSE,
+  col = "grey70"
+)
+
+hist(
+  res_KO_DHT_vs_DMSO$pvalue,
+  breaks = 100,
+  main = "Histogram of p-values: DHT vs DMSO in CHD1 KO",
+  xlab = "p-value",
+  freq = FALSE,
+  col = "grey70"
+)
+
+vsd <- vst(dds, blind = FALSE)
+
+sampleDists <- dist(t(assay(vsd)))
+sampleDistMatrix <- as.matrix(sampleDists)
+
+rownames(sampleDistMatrix) <- paste(vsd$group, vsd$replicate, sep = "_")
+colnames(sampleDistMatrix) <- rownames(sampleDistMatrix)
+
+heatmap.cols <- colorRampPalette(rev(brewer.pal(9, "Blues")))(255)
+
+pheatmap(
+  sampleDistMatrix,
+  clustering_distance_rows = sampleDists,
+  clustering_distance_cols = sampleDists,
+  col = heatmap.cols
+)
+
+plotPCA(vsd, intgroup = "group")
+plotPCA(vsd, intgroup = "replicate")
+
+plotMA(res_genotype, ylim = c(-6, 6), main = "CHD1 KO vs control")
+plotMA(res_KO_DHT_vs_DMSO, ylim = c(-6, 6), main = "DHT vs DMSO in CHD1 KO")
+```
+
+# Add gene symbols and export results
+
+```{r annotate-and-export-results}
+gene.annotation <- ensembldb::select(
+  EnsDb.Mmusculus.v79,
+  keys = rownames(dds),
+  keytype = "GENEID",
+  columns = c("GENEID", "SYMBOL")
+) %>%
+  distinct(GENEID, .keep_all = TRUE)
+
+add_gene_symbols <- function(res) {
+  res.df <- as.data.frame(res) %>%
+    rownames_to_column("ensembl_id") %>%
+    mutate(
+      gene = gene.annotation$SYMBOL[
+        match(ensembl_id, gene.annotation$GENEID)
+      ]
+    ) %>%
+    arrange(pvalue) %>%
+    dplyr::filter(!is.na(padj))
+
+  return(res.df)
+}
+
+res.genotype.df <- add_gene_symbols(res_genotype)
+res.dht.df <- add_gene_symbols(res_KO_DHT_vs_DMSO)
+res.dht.enz.df <- add_gene_symbols(res_KO_DEnz_vs_DHT)
+res.dmso.dht.enz.df <- add_gene_symbols(res_KO_DEnz_vs_DMSO)
+
+write.csv(
+  res.genotype.df,
+  "CHD1_KO_vs_control_DESeq2_results.csv",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+write.csv(
+  res.dht.df,
+  "CHD1_KO_DHT_vs_DMSO_DESeq2_results.csv",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+write.csv(
+  res.dht.enz.df,
+  "CHD1_KO_DHT_ENZ_vs_DHT_DESeq2_results.csv",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+write.csv(
+  res.dmso.dht.enz.df,
+  "CHD1_KO_DHT_ENZ_vs_DMSO_DESeq2_results.csv",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+sig.genotype <- res.genotype.df %>% dplyr::filter(padj < 0.1)
+sig.dht <- res.dht.df %>% dplyr::filter(padj < 0.1)
+sig.dht.enz <- res.dht.enz.df %>% dplyr::filter(padj < 0.1)
+sig.dmso.dht.enz <- res.dmso.dht.enz.df %>% dplyr::filter(padj < 0.1)
+```
+
+# Prepare p-value deciles
+
+```{r pvalue-deciles}
+res.genotype.df <- res.genotype.df %>%
+  mutate(pval.decile = ntile(pvalue, 10))
+
+res.dht.df <- res.dht.df %>%
+  mutate(pval.decile = ntile(pvalue, 10))
+
+res.dht.enz.df <- res.dht.enz.df %>%
+  mutate(pval.decile = ntile(pvalue, 10))
+
+res.dmso.dht.enz.df <- res.dmso.dht.enz.df %>%
+  mutate(pval.decile = ntile(pvalue, 10))
+
+topdecile.genotype <- res.genotype.df %>% dplyr::filter(pval.decile == 1)
+topdecile.dht <- res.dht.df %>% dplyr::filter(pval.decile == 1)
+topdecile.dht.enz <- res.dht.enz.df %>% dplyr::filter(pval.decile == 1)
+topdecile.dmso.dht.enz <- res.dmso.dht.enz.df %>% dplyr::filter(pval.decile == 1)
+
+write.csv(
+  topdecile.genotype,
+  "CHD1_KO_vs_control_top_pvalue_decile.csv",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+write.csv(
+  topdecile.dht,
+  "CHD1_KO_DHT_vs_DMSO_top_pvalue_decile.csv",
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# Plotting functions
+
+```{r plotting-functions}
+theme_chd1_paper <- function(base_size = 8) {
+  theme_classic(base_size = base_size) +
+    theme(
+      text = element_text(family = "Arial", colour = "black"),
+      axis.title = element_text(size = base_size, colour = "black"),
+      axis.text = element_text(size = base_size - 1, colour = "black"),
+      axis.line = element_line(linewidth = 0.4, colour = "black"),
+      axis.ticks = element_line(linewidth = 0.4, colour = "black"),
+      plot.title = element_text(size = base_size + 1, hjust = 0.5),
+      panel.border = element_blank(),
+      legend.position = "none"
+    )
+}
+
+plot_lfc_correlation <- function(res.x,
+                                 res.y,
+                                 xlab,
+                                 ylab,
+                                 title,
+                                 file,
+                                 decile = 1,
+                                 lims = NULL) {
+
+  x.decile <- res.x %>% dplyr::filter(pval.decile == decile)
+  y.decile <- res.y %>% dplyr::filter(pval.decile == decile)
+
+  lfc.compare <- inner_join(
+    x.decile,
+    y.decile,
+    by = "ensembl_id",
+    suffix = c("_x", "_y")
+  ) %>%
+    dplyr::filter(!is.na(log2FoldChange_x), !is.na(log2FoldChange_y))
+
+  cor.stats <- cor.test(
+    lfc.compare$log2FoldChange_x,
+    lfc.compare$log2FoldChange_y,
+    method = "pearson"
+  )
+
+  r.value <- unname(cor.stats$estimate)
+  p.value <- cor.stats$p.value
+
+  if (is.null(lims)) {
+    max.lim <- ceiling(max(abs(c(
+      lfc.compare$log2FoldChange_x,
+      lfc.compare$log2FoldChange_y
+    )), na.rm = TRUE))
+    lims <- c(-max.lim, max.lim)
+  }
+
+  p.label <- ifelse(
+    p.value < 2.2e-16,
+    "'< 2.2e-16'",
+    paste0("'= ", signif(p.value, 2), "'")
+  )
+
+  p <- ggplot(
+    lfc.compare,
+    aes(x = log2FoldChange_x, y = log2FoldChange_y)
+  ) +
+    geom_point(
+      shape = 21,
+      size = 1.4,
+      stroke = 0.25,
+      colour = "black",
+      fill = "black"
+    ) +
+    geom_vline(xintercept = 0, linewidth = 0.35) +
+    geom_hline(yintercept = 0, linewidth = 0.35) +
+    geom_smooth(
+      method = lm,
+      se = TRUE,
+      colour = "#E69F00",
+      fill = "grey75",
+      linewidth = 0.7
+    ) +
+    coord_fixed(xlim = lims, ylim = lims) +
+    theme_chd1_paper(base_size = 8) +
+    ggtitle(paste0(title, " (n = ", nrow(lfc.compare), ")")) +
+    xlab(xlab) +
+    ylab(ylab) +
+    annotate(
+      "text",
+      x = Inf,
+      y = Inf,
+      hjust = 1.1,
+      vjust = 1.4,
+      size = 3,
+      label = paste0(
+        "italic(r) == ", round(r.value, 3),
+        "*','~~italic(p)~", p.label
+      ),
+      parse = TRUE
+    )
+
+  print(p)
+
+  ggsave(
+    file,
+    p,
+    width = 3.2,
+    height = 2.6,
+    units = "in",
+    device = cairo_pdf
+  )
+
+  return(list(
+    data = lfc.compare,
+    plot = p,
+    r = r.value,
+    p = p.value,
+    n = nrow(lfc.compare)
+  ))
+}
+```
+
+# Figure 4E: CHD1 KO transcriptional signature is reversed by DHT
+
+```{r figure-4e-ko-dht-rescue}
+fig4e.ko.dht <- plot_lfc_correlation(
+  res.x = res.genotype.df,
+  res.y = res.dht.df,
+  xlab = expression(Log[2] * "FC CHD1 KO vs control"),
+  ylab = expression(Log[2] * "FC DHT vs DMSO in CHD1 KO"),
+  title = "CHD1 KO vs DHT response",
+  file = "Figure_4E_CHD1_KO_vs_DHT_decile1.pdf",
+  decile = 1,
+  lims = c(-1.5, 1.5)
+)
+
+write.csv(
+  fig4e.ko.dht$data,
+  "Figure_4E_CHD1_KO_vs_DHT_decile1_genes.csv",
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# Supplementary analysis: DHT response opposed by enzalutamide
+
+```{r supplementary-dht-vs-enz}
+sfig.dht.enz <- plot_lfc_correlation(
+  res.x = res.dht.df,
+  res.y = res.dht.enz.df,
+  xlab = expression(Log[2] * "FC DHT vs DMSO in CHD1 KO"),
+  ylab = expression(Log[2] * "FC DHT + ENZ vs DHT in CHD1 KO"),
+  title = "DHT response vs ENZ response",
+  file = "Supp_Figure_DHT_vs_ENZ_decile1.pdf",
+  decile = 1,
+  lims = c(-1.5, 1.5)
+)
+
+write.csv(
+  sfig.dht.enz$data,
+  "Supp_Figure_DHT_vs_ENZ_decile1_genes.csv",
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# Supplementary analysis: DHT + ENZ partially attenuates rescue
+
+```{r supplementary-ko-vs-dht-enz}
+sfig.ko.dht.enz <- plot_lfc_correlation(
+  res.x = res.genotype.df,
+  res.y = res.dmso.dht.enz.df,
+  xlab = expression(Log[2] * "FC CHD1 KO vs control"),
+  ylab = expression(Log[2] * "FC DHT + ENZ vs DMSO in CHD1 KO"),
+  title = "CHD1 KO vs DHT + ENZ response",
+  file = "Supp_Figure_CHD1_KO_vs_DHT_ENZ_decile1.pdf",
+  decile = 1,
+  lims = c(-2.5, 2.5)
+)
+
+write.csv(
+  sfig.ko.dht.enz$data,
+  "Supp_Figure_CHD1_KO_vs_DHT_ENZ_decile1_genes.csv",
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# All-gene correlations and Steiger's test
+
+```{r all-gene-correlations-and-steiger}
+all.lfc <- list(
+  genotype = res.genotype.df %>%
+    dplyr::select(ensembl_id, genotype_lfc = log2FoldChange, pval.decile),
+  dht = res.dht.df %>%
+    dplyr::select(ensembl_id, dht_lfc = log2FoldChange),
+  dht_enz = res.dmso.dht.enz.df %>%
+    dplyr::select(ensembl_id, dht_enz_lfc = log2FoldChange)
+) %>%
+  purrr::reduce(inner_join, by = "ensembl_id") %>%
+  dplyr::filter(
+    !is.na(genotype_lfc),
+    !is.na(dht_lfc),
+    !is.na(dht_enz_lfc)
+  )
+
+all.lfc.decile1 <- all.lfc %>%
+  dplyr::filter(pval.decile == 1)
+
+all.gene.r.dht <- cor(
+  all.lfc$genotype_lfc,
+  all.lfc$dht_lfc,
+  use = "complete.obs"
+)
+
+all.gene.r.dht.enz <- cor(
+  all.lfc$genotype_lfc,
+  all.lfc$dht_enz_lfc,
+  use = "complete.obs"
+)
+
+decile1.r.dht <- cor(
+  all.lfc.decile1$genotype_lfc,
+  all.lfc.decile1$dht_lfc,
+  use = "complete.obs"
+)
+
+decile1.r.dht.enz <- cor(
+  all.lfc.decile1$genotype_lfc,
+  all.lfc.decile1$dht_enz_lfc,
+  use = "complete.obs"
+)
+
+# Steiger's test comparing dependent correlations:
+# genotype vs DHT compared with genotype vs DHT + ENZ
+steiger.all.genes <- psych::r.test(
+  n = nrow(all.lfc),
+  r12 = all.gene.r.dht,
+  r13 = all.gene.r.dht.enz,
+  r23 = cor(all.lfc$dht_lfc, all.lfc$dht_enz_lfc, use = "complete.obs")
+)
+
+steiger.decile1 <- psych::r.test(
+  n = nrow(all.lfc.decile1),
+  r12 = decile1.r.dht,
+  r13 = decile1.r.dht.enz,
+  r23 = cor(
+    all.lfc.decile1$dht_lfc,
+    all.lfc.decile1$dht_enz_lfc,
+    use = "complete.obs"
+  )
+)
+
+steiger.all.genes
+steiger.decile1
+
+correlation.summary <- tibble(
+  analysis = c(
+    "All genes: genotype vs DHT",
+    "All genes: genotype vs DHT+ENZ",
+    "Top genotype p-value decile: genotype vs DHT",
+    "Top genotype p-value decile: genotype vs DHT+ENZ"
+  ),
+  n = c(
+    nrow(all.lfc),
+    nrow(all.lfc),
+    nrow(all.lfc.decile1),
+    nrow(all.lfc.decile1)
+  ),
+  r = c(
+    all.gene.r.dht,
+    all.gene.r.dht.enz,
+    decile1.r.dht,
+    decile1.r.dht.enz
+  )
+)
+
+write.csv(
+  correlation.summary,
+  "CHD1_KO_DHT_ENZ_correlation_summary.csv",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+write.csv(
+  all.lfc,
+  "CHD1_KO_DHT_ENZ_all_gene_lfc_table.csv",
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
