@@ -1,0 +1,457 @@
+---
+title: "CHD1 CUT&RUN analysis for Chd1R616Q NPCs"
+author: "Kimberley Jade Anderson"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 7,
+  fig.height = 5
+)
+```
+
+# Overview
+
+This R Markdown contains the CHD1 CUT&RUN analysis steps relevant to the manuscript figures and statements:
+
+- Bowtie2 alignment-rate summary
+- Peak-calling workflow documentation
+- DiffBind setup and consensus CHD1 peakset generation
+- Peak annotation
+- Overlap between CHD1-bound genes and the top RNA-seq p-value decile
+- Export of gene lists used for downstream interpretation
+
+Exploratory analyses and unused sections have been removed.
+
+# Libraries
+
+```{r libraries}
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(DiffBind)
+library(ChIPseeker)
+library(TxDb.Mmusculus.UCSC.mm10.ensGene)
+library(org.Mm.eg.db)
+library(Mus.musculus)
+library(VennDiagram)
+library(GeneOverlap)
+
+txdb <- TxDb.Mmusculus.UCSC.mm10.ensGene
+```
+
+# Alignment QC
+
+The original FASTQ processing, Bowtie2 alignment, SAM/BAM conversion, bigWig generation, and MACS3 peak calling were performed outside R. The commands are retained here for reproducibility but are not evaluated during knitting.
+
+```{bash bowtie2-fastqc, eval=FALSE}
+# Run FastQC
+find . -maxdepth 1 -mindepth 1 -type d -exec sh -c "cd '{}' && pwd && fastqc *.fastq.gz -t 90" \;
+
+# Align paired-end reads to mm10 using Bowtie2
+find . -maxdepth 1 -mindepth 1 -type d -exec sh -c "cd '{}' && \
+  bowtie2 -p 40 --time --met-stderr --met-file bt2_metrics.txt \
+  -x /hpcdata/Mimir/kimberl/mm10_bt2/mm10 \
+  -1 '{$1}'_L008_R1_001.fastq.gz \
+  -2 '{$1}'_L008_R2_001.fastq.gz \
+  -S '{$1}'.sam" \;
+```
+
+```{bash sam-to-bam, eval=FALSE}
+# Convert SAM files to coordinate-sorted BAM files
+for i in `ls */*.sam | rev | cut -c 5- | rev | uniq`
+do
+  samtools view -@ 16 -bS ${i}.sam | \
+  samtools sort -T ${i} -O BAM -@ 16 -o ${i}.bam
+done
+```
+
+```{bash macs3-peak-calling, eval=FALSE}
+# Merge IgG files for shared control
+samtools merge -o all_merged_IgGs.bam -@ 48 *IgG*.bam
+
+# Activate MACS3 environment
+ml load Anaconda3/2022.05
+conda activate /hpcapps/env/conda/MACS3
+
+# Call CHD1 peaks against merged IgG control
+for i in `ls *CHD1*.bam | rev | cut -c 5- | rev | uniq`
+do
+  echo "Calling peaks for sample: $i"
+  macs3 callpeak \
+    -t ${i}.bam \
+    -c all_merged_IgGs.bam \
+    -n ${i} \
+    -f BAMPE \
+    -g mm \
+    --outdir ${i} \
+    -q 0.1 \
+    --max-gap 300 \
+    --keep-dup all
+done
+```
+
+## Bowtie2 alignment-rate table
+
+```{r alignment-rate-table, eval=file.exists("20240411_bt2_output.txt"), cache=TRUE}
+bt2_file <- "20240411_bt2_output.txt"
+
+bt2_lines <- readLines(bt2_file)
+
+alignment.table <- tibble(line = bt2_lines) %>%
+  mutate(
+    is_sample = str_detect(line, "^/"),
+    sample = if_else(is_sample, basename(line), NA_character_)
+  ) %>%
+  tidyr::fill(sample) %>%
+  filter(str_detect(sample, regex("CHD1|IgG", ignore_case = TRUE))) %>%
+  filter(str_detect(line, "overall alignment rate")) %>%
+  mutate(
+    alignment_rate = str_extract(
+      line,
+      "\\d+\\.\\d+(?=% overall alignment rate)"
+    ) %>% as.numeric()
+  ) %>%
+  dplyr::select(sample, alignment_rate) %>%
+  arrange(sample)
+
+alignment.table %>%
+  kable(
+    caption = "Bowtie2 overall alignment rates for CHD1 and IgG CUT&RUN samples",
+    col.names = c("Sample", "Overall alignment rate (%)"),
+    digits = 2
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE
+  )
+
+write.csv(
+  alignment.table,
+  "CHD1_CUTRUN_bowtie2_alignment_rates.csv",
+  row.names = FALSE
+)
+```
+
+# BigWig files and TSS profiles
+
+These commands generate normalized bigWig files and CHD1 signal profiles over transcription start sites. They are retained as documentation of the figure-generation workflow.
+
+```{bash bigwig-and-tss-profile, eval=FALSE}
+module load deepTools
+module load SAMtools
+
+samtools index -M *merged.bam
+
+# Generate RPGC-normalized bigWig files
+for i in `ls *merged.bam | rev | cut -c 5- | rev | uniq`
+do
+  bamCoverage \
+    --bam ${i}.bam \
+    -o ${i}_depthnorm.bw \
+    -p max \
+    --binSize 5 \
+    --smoothLength 30 \
+    --normalizeUsing RPGC \
+    --effectiveGenomeSize 2652783500 \
+    --ignoreForNormalization chrX \
+    --minFragmentLength 130 \
+    --extendReads \
+    --centerReads
+done
+
+# Signal over TSSs
+computeMatrix reference-point \
+  --referencePoint TSS \
+  -o CHD1_overTSSs \
+  -S 20240816_CHD1_WT_DMSO_merged_depthnorm.bw \
+     20240816_CHD1_R616Q_DMSO_merged_depthnorm.bw \
+     20240816_CHD1_R616Q_DHT_merged_depthnorm.bw \
+  -R mm10_transcripts.bed \
+  -a 3000 \
+  -b 3000 \
+  -p 24 \
+  --samplesLabel WT Mut_DMSO Mut_DHT
+
+plotProfile -m CHD1_overTSSs -o CHD1_overTSSs.pdf
+plotProfile -m CHD1_overTSSs -o CHD1_overTSSs_olap.pdf --plotType overlapped_lines
+```
+
+# DiffBind sample sheet
+
+```{r sample-sheet, eval=dir.exists("Peak_calling") && file.exists("Genotypes.csv"), cache=TRUE}
+samples <- list.dirs("Peak_calling/", full.names = FALSE, recursive = FALSE)
+
+diffbind.samplesheet <- data.frame(
+  SampleID = samples[grepl("CHD1", samples)]
+)
+
+diffbind.samplesheet <- diffbind.samplesheet %>%
+  tidyr::separate_wider_delim(
+    SampleID,
+    delim = "_",
+    names = c("Embryo", "Treatment", "Factor", "Sample"),
+    cols_remove = FALSE
+  )
+
+genotypes <- read.csv2("Genotypes.csv")
+
+diffbind.samplesheet <- dplyr::left_join(
+  diffbind.samplesheet,
+  genotypes,
+  by = NULL
+)
+
+# Check what the genotype column is called
+names(diffbind.samplesheet)
+
+# Rename columns safely
+if ("Genotype" %in% names(diffbind.samplesheet)) {
+  diffbind.samplesheet <- diffbind.samplesheet %>%
+    dplyr::rename(Condition = Genotype)
+}
+
+if ("Embryo" %in% names(diffbind.samplesheet)) {
+  diffbind.samplesheet <- diffbind.samplesheet %>%
+    dplyr::rename(Tissue = Embryo)
+}
+
+if ("Sample" %in% names(diffbind.samplesheet)) {
+  diffbind.samplesheet <- diffbind.samplesheet %>%
+    dplyr::select(-Sample)
+}
+
+diffbind.samplesheet <- diffbind.samplesheet %>%
+  dplyr::mutate(
+    bamReads = paste0("bam_files/", SampleID, ".bam"),
+    controlID = "all_merged_IgGs",
+    bamControl = "bam_files/all_merged_IgGs.bam",
+    Peaks = paste0("Peak_calling/", SampleID, "/", SampleID, "_peaks.xls"),
+    PeakCaller = "macs"
+  )
+
+write.csv(
+  diffbind.samplesheet,
+  "diffBind_sampleSheet_generated.csv",
+  row.names = FALSE
+)
+
+diffbind.samplesheet
+```
+
+# DiffBind analysis
+
+This section creates a DiffBind object, counts reads in peaks, applies blacklist/greylist filtering, normalizes, tests for differential CHD1 occupancy, and exports the WT DMSO consensus peakset.
+
+```{r diffbind-analysis, eval=file.exists("diffBind_sampleSheet_1.csv"), cache=TRUE}
+final.samplesheet <- read.csv2("diffBind_sampleSheet_1.csv") %>%
+  filter(str_detect(SampleID, "CHD1"))
+
+dba.all <- dba(sampleSheet = final.samplesheet)
+plot(dba.all)
+
+dba.all <- dba.count(dba.all)
+```
+
+```{r, cache=TRUE}
+# Remove blacklist regions and generate/apply greylist
+dba.all <- dba.blacklist(dba.all, greylist = FALSE)
+
+# Normalize using native DiffBind methods with background signal
+chd1.norm.background <- dba.normalize(
+  dba.all,
+  method = DBA_ALL_METHODS,
+  normalize = DBA_NORM_NATIVE,
+  background = TRUE
+)
+
+# Test for differential occupancy by condition
+chd1.dba <- dba.analyze(
+  chd1.norm.background,
+  method = DBA_ALL_METHODS,
+  design = "~Condition"
+)
+
+dba.show(chd1.dba, bContrasts = TRUE)
+
+# Diagnostic plots
+dba.plotMA(chd1.dba, contrast = 1, method = DBA_DESEQ2)
+dba.plotMA(chd1.dba, contrast = 1, method = DBA_EDGER, bNormalized = TRUE, th = 0.1)
+dba.plotVolcano(chd1.dba, contrast = 1, method = DBA_EDGER, th = 0.1)
+
+# Export all tested sites
+chd1.diff.peaks <- dba.report(chd1.dba, th = 1, method = DBA_EDGER)
+chd1.diff.peaks.df <- as.data.frame(chd1.diff.peaks)
+
+write.csv(
+  chd1.diff.peaks.df,
+  "CHD1_diffPeaks_all_tested_sites.csv",
+  row.names = FALSE
+)
+
+# Retrieve WT DMSO consensus peaks
+chd1.wt.peaks <- dba.peakset(
+  chd1.dba,
+  chd1.dba$masks$`Chd1+/+` & chd1.dba$masks$DMSO,
+  bRetrieve = TRUE,
+  DataType = DBA_DATA_FRAME
+)
+
+write.table(
+  chd1.wt.peaks[, 1:3],
+  "CHD1_WT_DMSO_consensus_peaks.bed",
+  col.names = FALSE,
+  row.names = FALSE,
+  sep = "\t",
+  quote = FALSE
+)
+```
+
+# Merged WT CHD1 peakset
+
+For the manuscript, the CHD1-bound gene list was generated from merged WT DMSO CHD1 peaks, filtered by MACS score.
+
+```{r merged-wt-peakset, eval=file.exists("Merged_CHD1_peaks/20240816_CHD1_WT_DMSO_merged_q01/20240816_CHD1_WT_DMSO_merged_peaks.narrowPeak"), cache=TRUE}
+merged.wt.peaks <- read.table(
+  "Merged_CHD1_peaks/20240816_CHD1_WT_DMSO_merged_q01/20240816_CHD1_WT_DMSO_merged_peaks.narrowPeak",
+  header = FALSE
+)
+
+# MACS narrowPeak column 5 is the score.
+merged.wt.peaks.filtered <- merged.wt.peaks %>%
+  filter(V5 > 100)
+
+write.table(
+  merged.wt.peaks.filtered[, 1:4],
+  "merged_WT_CHD1_peaks_filtered.bed",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE,
+  sep = "\t"
+)
+```
+
+# Annotate CHD1 peaks
+
+```{r score-distribution, cache=FALSE}
+raw <- read.table(
+  "Merged_CHD1_peaks/20240816_CHD1_WT_DMSO_merged_q01/20240816_CHD1_WT_DMSO_merged_peaks.narrowPeak",
+  header = FALSE
+)
+
+cat("Score quantiles:\n")
+print(quantile(raw$V5, probs = c(0, 0.1, 0.25, 0.5, 0.75, 0.9, 1)))
+cat("\nPeaks with V5 > 200:", sum(raw$V5 > 200), "\n")
+cat("\nPeaks with V5 > 100:", sum(raw$V5 > 100), "\n")
+cat("Peaks with V5 > 50:", sum(raw$V5 > 50), "\n")
+cat("Peaks with V5 > 10:", sum(raw$V5 > 10), "\n")
+cat("Total peaks:", nrow(raw), "\n")
+```
+
+This will show us whether `V5 > 200` is genuinely filtering out a meaningful proportion of peaks or whether almost all peaks already exceed that threshold.
+
+```{r annotate-peaks}
+anno_function <- function(bedfile) {
+  cuttag_anno <- annotatePeak(
+    bedfile,
+    TxDb = txdb,
+    annoDb = "Mus.musculus"
+  )
+  plotAnnoPie(cuttag_anno)
+  as.data.frame(cuttag_anno)
+}
+
+CHD1_WT_peaks_anno <- anno_function("Merged_CHD1_peaks/20240816_CHD1_WT_DMSO_merged_q01/20240816_CHD1_WT_DMSO_merged_peaks.narrowPeak")
+nrow(CHD1_WT_peaks_anno)
+
+#Limit CHD1 peaks to only with score over 200
+CHD1_WT_peaks_anno <- CHD1_WT_peaks_anno[CHD1_WT_peaks_anno$V5 >200,]
+nrow(CHD1_WT_peaks_anno)
+write.table(CHD1_WT_peaks_anno[,c(1:4)], "merged_WT_CHD1_peaks_filtered.bed", 
+                col.names = FALSE, row.names = FALSE, quote = FALSE, sep = "\t")
+CHD1_WT_peaks_anno <- anno_function("merged_WT_CHD1_peaks_filtered.bed")
+
+cat("Peaks after filter:", nrow(CHD1_WT_peaks_anno), "\n")
+cat("Unique genes:", n_distinct(CHD1_WT_peaks_anno$SYMBOL), "\n")
+
+
+# DEGs
+genotype_DEGs <- read.csv("20231116_Chd1_NPC_genotype_DEGs.csv")
+genotype_DEGs$pval.decile <- ntile(genotype_DEGs$cor.pval, 10)
+genotype_DEGs_top.dec <- genotype_DEGs %>% filter(pval.decile == 1)
+
+# Unique gene sets
+chd1.bound.genes <- CHD1_WT_peaks_anno %>%
+  filter(!is.na(SYMBOL), SYMBOL != "") %>%
+  distinct(SYMBOL)
+
+deg.top.genes <- genotype_DEGs_top.dec %>%
+  filter(!is.na(gene), gene != "") %>%
+  distinct(gene)
+
+overlap.genes <- intersect(CHD1_WT_peaks_anno$SYMBOL, deg.top.genes$gene)
+
+cat("CHD1-bound genes:", nrow(chd1.bound.genes), "\n")
+cat("Top decile DEGs:", nrow(deg.top.genes), "\n")
+cat("Overlap:", length(overlap.genes), "\n")
+```
+
+# Overlap between CHD1-bound genes and RNA-seq results
+
+This analysis asks how many genes in the top p-value decile from the genotype RNA-seq comparison are directly associated with CHD1 CUT&RUN peaks.
+
+```{r cutrun-rnaseq-overlap}
+
+
+overlap.genes <- intersect(chd1.bound.genes$SYMBOL, deg.top.genes$gene)
+
+cat("CHD1-bound genes:", nrow(chd1.bound.genes), "\n")
+cat("Top decile DEGs:", nrow(deg.top.genes), "\n")
+cat("Overlap:", length(overlap.genes), "\n")
+```
+
+## Venn diagram
+
+```{r cutrun-rnaseq-venn}
+
+chd1.rnaseq.venn <- draw.pairwise.venn(
+  area1      = nrow(chd1.bound.genes),
+  area2      = nrow(deg.top.genes),
+  cross.area = length(overlap.genes),
+  euler.d    = TRUE,
+  scaled     = TRUE,
+  ext.text   = TRUE,
+  category   = c("CHD1-bound genes", "Top RNA-seq p-value decile")
+)
+
+pdf("CHD1_CUTRUN_RNAseq_top10percent_venn.pdf", height = 1.5, width = 1.5, pointsize = 6)
+grid.draw(chd1.rnaseq.venn)
+dev.off()
+```
+
+## Fisher's exact test for overlap
+
+```{r cutrun-rnaseq-fisher,cache=TRUE}
+gene.overlap <- newGeneOverlap(
+  chd1.bound.genes$SYMBOL,
+  deg.top.genes$gene,
+  spec = "mm9.gene"
+)
+gene.overlap <- testGeneOverlap(gene.overlap)
+gene.overlap
+```
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
