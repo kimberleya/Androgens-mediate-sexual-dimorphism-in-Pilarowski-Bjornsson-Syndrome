@@ -1,0 +1,638 @@
+---
+title: "Chd1^R616Q^ Mouse — Statistical Analysis"
+author: "Kimberley Jade Anderson"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    df_print: paged
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 8,
+  fig.height = 5,
+  dpi = 150
+)
+```
+
+```{css, echo=FALSE}
+/* ── Typography ── */
+body   { font-family: "Source Sans Pro", sans-serif; font-size: 15px; }
+h1, h2 { color: #2c3e50; }
+h3     { color: #5960AB; }
+
+/* ── Callout boxes ── */
+.note {
+  background: #eef3fb; border-left: 4px solid #5960AB;
+  padding: 10px 15px; border-radius: 4px; margin: 12px 0;
+}
+.warn {
+  background: #fff4e5; border-left: 4px solid #EE4142;
+  padding: 10px 15px; border-radius: 4px; margin: 12px 0;
+}
+
+/* ── Code blocks ── */
+pre { background: #f8f9fa; border-radius: 6px; }
+```
+
+# Overview
+
+This document presents the statistical analyses underpinning the *Chd1^R616Q^* manuscript, covering:
+
+- **Body-weight trajectories** — early postnatal, adult, and castrated cohorts
+- **Effect-size summary** — partial η² and Cohen's *d* for Welch's *t*-tests
+- **NPC cell-cycle composition** — MANOVA + univariate follow-ups
+- **Embryonic testosterone treatment** — Ki67 proliferation by genotype × treatment
+
+---
+
+# Packages
+
+```{r libraries}
+library(tidyverse)
+library(ggplot2)
+library(lme4)
+library(lmerTest)
+```
+
+---
+
+# Helper Functions {.tabset}
+
+## Timepoint ordering
+
+```{r helper-order-timepoints}
+order_timepoints <- function(tp) {
+  num <- suppressWarnings(as.numeric(stringr::str_extract(tp, "\\d+")))
+  if (all(is.na(num))) sort(unique(tp)) else unique(tp)[order(num, tp)]
+}
+```
+
+## Partial η²
+
+```{r helper-eta-sq}
+partial_eta_sq <- function(anova_table) {
+  results <- data.frame(
+    Effect       = rownames(anova_table),
+    F_value      = round(anova_table[["F value"]], 4),
+    NumDF        = anova_table[["NumDF"]],
+    DenDF        = round(anova_table[["DenDF"]], 3),
+    p_value      = round(anova_table[["Pr(>F)"]], 6),
+    partial_eta2 = NA_real_
+  )
+
+  ms_residual          <- anova_table[["Mean Sq"]] / anova_table[["F value"]]
+  ss_residual          <- ms_residual * anova_table[["DenDF"]]
+  ss_effect            <- anova_table[["Sum Sq"]]
+  results$partial_eta2 <- round(ss_effect / (ss_effect + ss_residual), 4)
+
+  results$interpretation <- cut(
+    results$partial_eta2,
+    breaks = c(-Inf, 0.01, 0.06, 0.14, Inf),
+    labels = c("negligible", "small", "medium", "large")
+  )
+  results
+}
+```
+
+## Main analysis function
+
+```{r helper-main-fn}
+read_weights_and_analyze <- function(
+    csv_file,
+    sep            = ",",
+    id_col         = NULL,
+    sex_col        = "Sex",
+    genotype_col   = "Genotype",
+    output_prefix  = "weights",
+    plot_width     = 6.2,
+    plot_height    = 4.2,
+    crossbar_width = 2,
+    breaks         = breaks,
+    point_dodge    = 2,
+    point_jitter   = 0.8,
+    pos            = position_identity()) {
+
+  # 1) Read
+  df <- read.delim(csv_file, sep = sep, header = TRUE, check.names = FALSE)
+
+  required    <- c(sex_col, genotype_col)
+  missing_req <- setdiff(required, names(df))
+  if (length(missing_req) > 0)
+    stop("Missing required column(s): ", paste(missing_req, collapse = ", "))
+
+  # 2) Ensure MouseID exists
+  if (!is.null(id_col) && id_col %in% names(df)) {
+    df <- df %>% rename(MouseID = all_of(id_col))
+  } else if (!("MouseID" %in% names(df))) {
+    df <- df %>% mutate(MouseID = paste0(.data[[sex_col]], "_", row_number()))
+  }
+
+  # 3) Detect timepoint columns
+  meta_cols <- c(sex_col, genotype_col, "MouseID")
+  time_cols <- setdiff(names(df), meta_cols)
+  if (length(time_cols) < 2)
+    stop("Need at least 2 timepoint columns. Detected: ", paste(time_cols, collapse = ", "))
+
+  # 4) Long format
+  df_long <- df %>%
+    pivot_longer(cols = all_of(time_cols), names_to = "Timepoint", values_to = "Weight") %>%
+    mutate(
+      Sex      = as.factor(.data[[sex_col]]),
+      Genotype = as.factor(.data[[genotype_col]]),
+      Weight   = as.numeric(Weight),
+      Age      = as.numeric(stringr::str_extract(Timepoint, "\\d+"))
+    )
+
+  # 5) Order timepoints
+  tp_levels <- order_timepoints(df_long$Timepoint)
+  df_long   <- df_long %>% mutate(Timepoint = factor(Timepoint, levels = tp_levels))
+
+  # 6) Report dropped rows
+  dropped_rows <- df_long %>% filter(is.na(Weight) | is.na(Age))
+  if (nrow(dropped_rows) > 0) {
+    message("\n⚠️  Rows excluded (NA Weight or Age):")
+    dropped_rows %>% count(Sex, Genotype, Timepoint, name = "n_missing") %>% print()
+  } else {
+    message("✓ No rows dropped.")
+  }
+
+  # 7) Summary stats
+  df_sum <- df_long %>%
+    group_by(Sex, Genotype, Timepoint, Age) %>%
+    summarise(
+      mean = mean(Weight, na.rm = TRUE),
+      sd   = sd(Weight,  na.rm = TRUE),
+      n    = sum(!is.na(Weight)),
+      .groups = "drop"
+    )
+
+  # ── Plotting ──────────────────────────────────────────────────────────────
+  plot_one_sex <- function(sex_letter) {
+    p_dat        <- df_long %>% filter(Sex == sex_letter)
+    p_sum        <- df_sum  %>% filter(Sex == sex_letter)
+    geno_levels  <- levels(p_dat$Genotype)
+    geno_offsets <- setNames(c(-point_dodge / 2, point_dodge / 2), geno_levels)
+
+    ggplot() +
+      geom_point(
+        data = p_dat,
+        aes(x = Age + geno_offsets[as.character(Genotype)],
+            y = Weight, color = Genotype, shape = Genotype),
+        position = pos, alpha = 0.87, size = 3, stroke = 1
+      ) +
+      geom_errorbar(
+        data = p_sum,
+        aes(x    = Age + geno_offsets[as.character(Genotype)],
+            ymin = mean - sd, ymax = mean + sd, color = Genotype),
+        width = 0.4, linewidth = 0.3
+      ) +
+      geom_line(
+        data = p_sum,
+        aes(x = Age + geno_offsets[as.character(Genotype)],
+            y = mean, color = Genotype, group = Genotype),
+        linewidth = 0.8
+      ) +
+      geom_crossbar(
+        data = p_sum,
+        aes(x = Age + geno_offsets[as.character(Genotype)],
+            y = mean, ymin = mean, ymax = mean, group = Genotype),
+        width = crossbar_width, linewidth = 0.45, color = "black"
+      ) +
+      scale_x_continuous(
+        breaks = sort(unique(p_dat$Age)),
+        labels = sort(unique(p_dat$Age))
+      ) +
+      scale_y_continuous(
+        limits = c(0, NA),
+        expand = expansion(mult = c(0, 0.05)),
+        breaks = breaks
+      ) +
+      scale_color_manual(values = c(
+        "Chd1+/+"     = "#5960AB",
+        "Chd1+/R616Q" = "#EE4142"
+      )) +
+      scale_shape_manual(values = c(
+        "Chd1+/+"     = 1,
+        "Chd1+/R616Q" = 17
+      )) +
+      labs(
+        title  = paste(sex_letter, "— weight over time"),
+        x      = "Age (days)",
+        y      = "Weight (g)",
+        color  = "Genotype",
+        shape  = "Genotype"
+      ) +
+      theme_classic(base_size = 20) +
+      theme(
+        axis.title        = element_text(size = 24, color = "black"),
+        axis.text         = element_text(size = 20, color = "black"),
+        axis.line         = element_line(linewidth = 0.8, color = "black"),
+        axis.ticks        = element_line(linewidth = 0.8, color = "black"),
+        axis.ticks.length = unit(0.22, "cm"),
+        legend.position   = "right",
+        legend.title      = element_text(size = 18),
+        legend.text       = element_text(size = 16),
+        plot.margin       = margin(10, 15, 10, 10)
+      )
+  }
+
+  sexes <- sort(unique(as.character(df_long$Sex)))
+  plots <- setNames(lapply(sexes, plot_one_sex), sexes)
+
+  for (sx in names(plots)) {
+    ggsave(
+      filename = paste0(output_prefix, "_", sx, ".pdf"),
+      plot     = plots[[sx]],
+      width    = plot_width,
+      height   = plot_height,
+      dpi      = 300
+    )
+  }
+
+  # ── Statistics ────────────────────────────────────────────────────────────
+  model_all    <- lmer(Weight ~ Genotype * Timepoint + (1 | MouseID), data = df_long)
+  model_by_sex <- lapply(sexes, function(sx)
+    lmer(Weight ~ Genotype * Timepoint + (1 | MouseID),
+         data = df_long %>% filter(Sex == sx)))
+  names(model_by_sex) <- sexes
+
+  list(
+    df           = df,
+    df_long      = df_long,
+    df_sum       = df_sum,
+    dropped_rows = dropped_rows,
+    plots        = plots,
+    model_all    = model_all,
+    anova_all    = anova(model_all),
+    model_by_sex = model_by_sex,
+    anova_by_sex = lapply(model_by_sex, anova),
+    eta_by_sex   = lapply(model_by_sex, function(m) partial_eta_sq(anova(m)))
+  )
+}
+```
+
+---
+
+# Body-Weight Trajectories
+
+## Early postnatal cohort
+
+```{r young-mice, cache=TRUE}
+young_mice <- read_weights_and_analyze(
+  "Mouse_early_weights.csv",
+  sep            = ";",
+  output_prefix  = "young",
+  plot_width     = 9,
+  plot_height    = 5,
+  crossbar_width = 0.3,
+  point_dodge    = 0.4,
+  point_jitter   = 0.001,
+  pos            = position_identity(),
+  breaks         = function(x) seq(0, x[2], by = 2)
+)
+```
+
+### Plots {.tabset}
+
+#### Female
+```{r young-plot-F, fig.width=9, fig.height=5}
+young_mice$plots[["F"]]
+```
+
+#### Male
+```{r young-plot-M, fig.width=9, fig.height=5}
+young_mice$plots[["M"]]
+```
+
+### Dropped observations
+```{r young-dropped}
+young_mice$dropped_rows
+```
+
+### Mixed-model ANOVA — effect sizes by sex
+```{r young-eta}
+young_mice$eta_by_sex
+```
+
+---
+
+## Adult cohort
+
+```{r adult-mice, cache=TRUE}
+adult_mice <- read_weights_and_analyze(
+  "adult_mice_weights.csv",
+  sep            = ";",
+  output_prefix  = "adult",
+  plot_width     = 9,
+  plot_height    = 5,
+  crossbar_width = 3,
+  point_dodge    = 3.8,
+  pos            = position_jitter(width = 1, height = 0),
+  breaks         = function(x) seq(0, x[2], by = 5)
+)
+```
+
+### Plots {.tabset}
+
+#### Female
+```{r adult-plot-F, fig.width=9, fig.height=5}
+adult_mice$plots[["F"]]
+```
+
+#### Male
+```{r adult-plot-M, fig.width=9, fig.height=5}
+adult_mice$plots[["M"]]
+```
+
+### Dropped observations
+```{r adult-dropped}
+adult_mice$dropped_rows
+```
+
+### Overall mixed-model ANOVA
+```{r adult-anova-all}
+adult_mice$anova_all
+```
+
+### Mixed-model ANOVA by sex
+```{r adult-anova-sex}
+adult_mice$anova_by_sex
+```
+
+### Effect sizes by sex
+```{r adult-eta}
+adult_mice$eta_by_sex
+```
+
+---
+
+## Castrated cohort
+
+```{r castrated-mice, cache=TRUE}
+castrated <- read_weights_and_analyze(
+  "castrated_weights_clean.csv",
+  sep            = ";",
+  output_prefix  = "castrated",
+  plot_width     = 9,
+  plot_height    = 5,
+  crossbar_width = 3,
+  point_dodge    = 1.5,
+  pos            = position_jitter(width = 0.05, height = 0),
+  breaks         = function(x) seq(0, x[2], by = 5)
+)
+```
+
+### Plots {.tabset}
+
+#### Female
+```{r castrated-plot-F, fig.width=9, fig.height=5}
+castrated$plots[["F"]]
+```
+
+#### Male
+```{r castrated-plot-M, fig.width=9, fig.height=5}
+castrated$plots[["M"]]
+```
+
+### Mixed-model ANOVA by sex
+```{r castrated-anova}
+castrated$anova_by_sex
+```
+
+### Effect sizes by sex
+```{r castrated-eta}
+castrated$eta_by_sex
+```
+
+---
+
+# Effect-Size Summary (Welch's *t*-tests)
+
+<div class="note">
+η² values from individual Welch's *t*-tests are converted to Cohen's *d* via  
+*d* = 2√(η² / (1 − η²)).  Benchmarks: negligible < 0.2, small 0.2–0.5, medium 0.5–0.8, large > 0.8.
+</div>
+
+```{r cohens-d-fn}
+eta2_to_cohens_d <- function(eta2, label = NULL) {
+  d <- 2 * sqrt(eta2 / (1 - eta2))
+  interpretation <- cut(
+    abs(d),
+    breaks = c(-Inf, 0.2, 0.5, 0.8, Inf),
+    labels = c("negligible", "small", "medium", "large")
+  )
+  result <- data.frame(
+    eta2           = round(eta2, 4),
+    cohens_d       = round(d,   4),
+    interpretation = interpretation
+  )
+  if (!is.null(label)) result <- cbind(comparison = label, result)
+  result
+}
+```
+
+```{r welch-effects}
+welch_effect_sizes <- rbind(
+  eta2_to_cohens_d(0.3151, "Female surface righting"),
+  eta2_to_cohens_d(0.2366, "Phenotype score: females vs males"),
+  eta2_to_cohens_d(0.4558, "MWM velocity"),
+  eta2_to_cohens_d(0.3744, "MWM distance"),
+  eta2_to_cohens_d(0.7785, "Western blot protein"),
+  eta2_to_cohens_d(0.2443, "Open field (female)"),
+  eta2_to_cohens_d(0.5494, "MTT assay — female NPCs"),
+  eta2_to_cohens_d(0.2534, "Oxytocin ELISA"),
+  eta2_to_cohens_d(0.8667, "Indels in RNA")
+)
+
+welch_effect_sizes
+```
+
+---
+
+# NPC Cell-Cycle Composition
+
+## Data
+
+```{r cell-cycle-data}
+cell_cycle <- read.csv("NPC_Cell_cycle.csv",
+                       row.names = 1, header = TRUE, check.names = FALSE)
+
+genotype_labels <- colnames(cell_cycle)
+
+df_cc <- as.data.frame(t(cell_cycle))
+colnames(df_cc) <- c("G0G1", "S", "G2M")
+df_cc$Genotype  <- factor(genotype_labels,
+                           levels = c("Chd1+/+", "Chd1R616Q/+"))
+rownames(df_cc)  <- NULL
+df_cc <- df_cc %>% mutate(across(c(G0G1, S, G2M), as.numeric))
+
+df_cc
+```
+
+## MANOVA
+
+```{r cell-cycle-manova}
+manova_fit     <- manova(cbind(G0G1, S, G2M) ~ Genotype, data = df_cc)
+manova_summary <- summary(manova_fit, test = "Pillai")
+manova_summary
+```
+
+```{r pillai}
+pillai <- manova_summary$stats["Genotype", "Pillai"]
+cat("Pillai's trace (overall effect size):", round(pillai, 4), "\n")
+```
+
+## Univariate follow-ups
+
+```{r cell-cycle-univariate}
+univariate_summary <- summary.aov(manova_fit)
+univariate_summary
+```
+
+## Effect sizes per phase
+
+```{r cell-cycle-eta}
+cat("Available names in univariate_summary:\n")
+print(names(univariate_summary))
+
+phases <- c("G0G1", "S", "G2M")
+
+uni_results <- do.call(rbind, lapply(phases, function(ph) {
+  
+  # Find the matching name flexibly
+  key <- names(univariate_summary)[grepl(ph, names(univariate_summary))]
+  
+  if (length(key) == 0) {
+    warning("No match found for phase: ", ph)
+    return(NULL)
+  }
+  
+  aov_table   <- univariate_summary[[key]]
+  ss_effect   <- as.numeric(aov_table["Genotype",  "Sum Sq"])
+  ss_residual <- as.numeric(aov_table["Residuals", "Sum Sq"])
+  f_val       <- as.numeric(aov_table["Genotype",  "F value"])
+  df_num      <- as.numeric(aov_table["Genotype",  "Df"])
+  df_den      <- as.numeric(aov_table["Residuals", "Df"])
+  p_val       <- as.numeric(aov_table["Genotype",  "Pr(>F)"])
+  eta2        <- ss_effect / (ss_effect + ss_residual)
+  d           <- 2 * sqrt(eta2 / (1 - eta2))
+
+  data.frame(
+    Phase    = ph,
+    mean_WT  = round(mean(df_cc[df_cc$Genotype == "Chd1+/+",     ph], na.rm = TRUE), 3),
+    mean_Mut = round(mean(df_cc[df_cc$Genotype == "Chd1R616Q/+", ph], na.rm = TRUE), 3),
+    F_value  = round(f_val, 4),
+    df_num   = df_num,
+    df_den   = df_den,
+    p_raw    = round(p_val, 6),
+    eta2     = round(eta2,  4),
+    cohens_d = round(d,     4)
+  )
+}))
+
+uni_results
+```
+
+
+---
+
+# Embryonic Testosterone Treatment — Ki67 FACS
+
+## Data
+
+```{r embryo-data}
+df_raw <- read.csv("Embryo_T_Treatment.csv",
+                   header = TRUE, check.names = FALSE, row.names = 1,
+                   fileEncoding = "latin1")
+
+genotype_labels  <- colnames(df_raw)
+colnames(df_raw) <- make.unique(colnames(df_raw))
+rownames(df_raw) <- c("Corn oil", "Testosterone")
+
+df_ki67 <- df_raw %>%
+  mutate(Treatment = trimws(rownames(.))) %>%
+  pivot_longer(cols = -Treatment, names_to = "Sample", values_to = "Ki67_pct") %>%
+  mutate(Genotype = rep(genotype_labels, times = nrow(df_raw))) %>%
+  filter(!is.na(Ki67_pct) & Ki67_pct != "") %>%
+  mutate(
+    Ki67_pct  = as.numeric(Ki67_pct),
+    Genotype  = factor(Genotype,  levels = c("Chd1+/+", "Chd1R616Q/+")),
+    Treatment = factor(Treatment, levels = c("Corn oil", "Testosterone"))
+  ) %>%
+  select(Genotype, Treatment, Ki67_pct)
+
+df_ki67
+
+cat("\nSample sizes per group:\n")
+print(table(df_ki67$Genotype, df_ki67$Treatment))
+```
+
+## Two-way ANOVA
+
+```{r embryo-anova}
+aov_fit     <- aov(Ki67_pct ~ Genotype * Treatment, data = df_ki67)
+aov_summary <- summary(aov_fit)
+aov_summary
+```
+
+## Effect sizes (η²)
+
+```{r embryo-eta}
+ss_table <- as.data.frame(aov_summary[[1]])
+ss_total <- sum(ss_table[["Sum Sq"]], na.rm = TRUE)
+
+effect_sizes <- data.frame(
+  Effect  = trimws(rownames(ss_table)[1:3]),
+  SS      = round(ss_table[["Sum Sq"]][1:3], 4),
+  F_value = round(ss_table[["F value"]][1:3], 4),
+  p_value = round(ss_table[["Pr(>F)"]][1:3], 6),
+  eta2    = round(ss_table[["Sum Sq"]][1:3] / ss_total, 6)
+)
+
+effect_sizes
+```
+
+## Post-hoc comparisons (Tukey HSD)
+
+```{r embryo-tukey}
+TukeyHSD(aov_fit)
+```
+
+## Post-hoc effect sizes
+
+```{r embryo-posthoc-eta}
+eta2_from_groups <- function(a, b, label) {
+  tt   <- t.test(a, b, var.equal = FALSE)
+  eta2 <- tt$statistic^2 / (tt$statistic^2 + tt$parameter)
+  cat(label, "— eta²:", round(eta2, 4), "\n")
+}
+
+wt_oil  <- df_ki67$Ki67_pct[df_ki67$Genotype == "Chd1+/+"     & df_ki67$Treatment == "Corn oil"]
+wt_T    <- df_ki67$Ki67_pct[df_ki67$Genotype == "Chd1+/+"     & df_ki67$Treatment == "Testosterone"]
+mut_oil <- df_ki67$Ki67_pct[df_ki67$Genotype == "Chd1R616Q/+" & df_ki67$Treatment == "Corn oil"]
+mut_T   <- df_ki67$Ki67_pct[df_ki67$Genotype == "Chd1R616Q/+" & df_ki67$Treatment == "Testosterone"]
+
+eta2_from_groups(mut_T,  mut_oil, "Mut testosterone vs Mut corn oil")
+eta2_from_groups(mut_T,  wt_T,   "Mut testosterone vs WT testosterone")
+```
+
+---
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
