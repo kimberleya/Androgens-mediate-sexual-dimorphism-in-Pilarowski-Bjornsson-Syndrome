@@ -1,0 +1,239 @@
+---
+title: "CHD1_AR_motif"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## CHD1 CUT&RUN motif analysis
+First, I selected the top 50,000 most significant CHD1 peaks (lowest p-values) from the WT analysis (called using MACS2 from combined bed files, using q < 0.01 for peak calling) and ran through AME in the online MEME suite tool with the following settings:
+
+* Sequence motif score: avg_odds
+* HOCOMOCO v12 known motifs (Human and mouse orthologs)
+* Background model source: letter frequencies in (primary) sequences file (20240816_CHD1_WT_DMSO_merged_peaks_to_50k.bed.txt.fa)
+* Background model frequencies: 0.28529,0.21471,0.21471,0.28529
+* Total pseudocount added to a motif column: 0.1
+* Statistical test: Fisher's exact test (optimized over motif scores)
+* Labeling positives: all 10000 primary sequences are labeled as 'positive'; all 10000 control sequences are labeled as 'negative'
+* Classifying positives: sequences with the motif scores ≥ 'TP Thresh' are classified as positive
+* E-value threshold for reporting results: 10
+
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+```
+
+## Reading in files
+
+Here we read in the outputs we got from AME in online MEME suite:
+
+```{r reading_in_files}
+# Path to your AME tsv file(s)
+# If you have multiple groups, list them all with names
+ame_files <- list(
+  "MUT_DMSO" = "C:/Users/kimberl/OneDrive - Menntaský/HTB Lab/Bioinformatics analyses/20240410_Decode_cutandrun/Merged_CHD1_peaks/20240816_CHD1_R616Q_DMSO_merged_q01/ame (1).tsv",
+  "MUT_DHT"  = "C:/Users/kimberl/OneDrive - Menntaský/HTB Lab/Bioinformatics analyses/20240410_Decode_cutandrun/Merged_CHD1_peaks/20240816_CHD1_R616Q_DHT_merged_q01/ame.tsv",
+  "WT_DMSO" = "C:/Users/kimberl/OneDrive - Menntaský/HTB Lab/Bioinformatics analyses/20240410_Decode_cutandrun/Merged_CHD1_peaks/20240816_CHD1_WT_DMSO_merged_q01/ame_new_50k.tsv"
+  )
+
+
+# Output file
+outfile <- "AME_bubble_plot.pdf"
+
+##############################################################################
+# LOAD AND PARSE AME FILES
+##############################################################################
+
+read_ame <- function(path, group_name) {
+  # Skip comment lines starting with #
+  lines <- readLines(path)
+  data_lines <- lines[!grepl("^#", lines)]
+  df <- read.table(
+    text  = paste(data_lines, collapse = "\n"),
+    header = TRUE,
+    sep    = "\t",
+    quote  = "",
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  )
+  df$group <- group_name
+  return(df)
+}
+
+ame_list <- list()
+for (name in names(ame_files)) {
+  ame_list[[name]] <- read_ame(ame_files[[name]], name)
+}
+ame_data <- bind_rows(ame_list)
+
+# Clean up column names (remove special characters)
+colnames(ame_data) <- make.names(colnames(ame_data))
+# Rename key columns for convenience
+ame_data <- ame_data %>%
+  rename(
+    motif_ID    = motif_ID,
+    pvalue      = p.value,
+    adj_pvalue  = adj_p.value,
+    evalue      = E.value
+  )
+```
+
+## Filter to motifs of interest
+
+```{r}
+# Motifs to plot — use the motif_ID column values
+# Edit this list to whatever you want to show
+motifs_to_plot <- c(
+  "ANDR.H12CORE.2.P.B",    # Androgen receptor — key for reviewer
+  "FOXA1.H12CORE.0.P.B",   # FOXA1 pioneer factor
+  "SP1.H12CORE.2.P.B",     # SP1
+  "KLF4.H12CORE.0.PSM.A"    # KLF4
+  # add or remove motifs here
+)
+
+plot_data <- ame_data %>%
+  dplyr::filter(motif_ID %in% motifs_to_plot) %>%
+  mutate(
+    # Clean up motif names for display — take just the TF name before first dot
+    motif_label = sub("\\..*", "", motif_ID),
+    # Fix AR label
+    motif_label = ifelse(motif_label == "ANDR", "AR", motif_label),
+    # log10 transform for plotting
+    log10_pvalue = -log10(pvalue),
+    log10_evalue = -log10(evalue),
+    # Factor for ordering — use the order in motifs_to_plot
+    motif_label = factor(motif_label,
+                         levels = rev(sub("\\..*", "",
+                                          gsub("ANDR", "AR", motifs_to_plot)))),
+    group = factor(group, levels = names(ame_files))
+  )
+
+# Warn if any requested motifs are missing
+missing <- setdiff(motifs_to_plot, ame_data$motif_ID)
+if (length(missing) > 0) {
+  message("Warning: these motifs were not found in the AME output:\n",
+          paste(missing, collapse = "\n"))
+}
+```
+
+## Plot
+
+```{r}
+p <- ggplot(plot_data,
+            aes(x     = group,
+                y     = motif_label,
+                size  = log10_evalue,
+                color = log10_pvalue)) +
+  geom_point(alpha = 0.9) +
+  scale_size_continuous(
+    name   = expression(-log[10](E-value)),
+    range  = c(2, 12),
+    breaks = pretty(plot_data$log10_evalue, n = 4)
+  ) +
+  scale_color_gradientn(
+    name   = expression(-log[10](p-value)),
+    colors = c("grey90", "#CBC3E3", "#9B59B6", "#6C3483", "#1A0533"),
+    guide  = guide_colorbar(barwidth = 1, barheight = 6)
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1, color = "black"),
+    axis.text.y      = element_text(color = "black"),
+    axis.title       = element_blank(),
+    axis.line        = element_line(color = "grey40"),
+    axis.ticks       = element_line(color = "grey40"),
+    panel.background = element_rect(fill = "white"),
+    plot.background  = element_rect(fill = "white"),
+    legend.background = element_rect(fill = "white"),
+    legend.text      = element_text(color = "black"),
+    legend.title     = element_text(color = "black"),
+    panel.grid.major = element_line(color = "grey", linewidth = 0.3),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    title = "Motif enrichment at CHD1 CUT&RUN peaks"
+  ) +
+  theme(plot.title = element_text(color = "white", hjust = 0.5))
+
+print(p)
+
+ggsave(outfile, p, width = 5, height = 4, device = "pdf")
+message("Plot saved to: ", outfile)
+
+# Also print a quick summary table of the plotted values
+plot_data %>%
+  dplyr::select(group, motif_label, pvalue, adj_pvalue, evalue) %>%
+  arrange(group, pvalue) %>%
+  as.data.frame()
+
+plot_data
+
+# Plot WT_DMSO only
+plot_data_wt <- plot_data %>%
+  dplyr::filter(group == "WT_DMSO")
+
+plot_data_wt
+
+p_wt <- ggplot(plot_data_wt,
+               aes(x     = group,
+                   y     = motif_label,
+                   size  = log10_evalue,
+                   color = log10_pvalue)) +
+  geom_point(alpha = 0.9) +
+  scale_size_continuous(
+    name   = expression(-log[10](E-value)),
+    range  = c(2, 12),
+    limits = c(0, max(plot_data_wt$log10_pvalue)),
+    breaks = c(0, pretty(plot_data_wt$log10_evalue, n = 3))
+  ) +
+  scale_color_gradient(
+    low    = "grey",
+    high   = "darkblue",
+    name   = expression(-log[10](p-value)),
+    limits = c(0, max(plot_data_wt$log10_pvalue)),
+    guide  = guide_colorbar(barwidth = 1, barheight = 6)
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text.x       = element_text(angle = 45, hjust = 1, color = "black"),
+    axis.text.y       = element_text(color = "black"),
+    axis.title        = element_blank(),
+    axis.line         = element_line(color = "grey40"),
+    axis.ticks        = element_line(color = "grey40"),
+    panel.background  = element_rect(fill = "white"),
+    plot.background   = element_rect(fill = "white"),
+    legend.background = element_rect(fill = "white"),
+    legend.text       = element_text(color = "black"),
+    legend.title      = element_text(color = "black"),
+    panel.grid.major  = element_line(color = "grey", linewidth = 0.3),
+    panel.grid.minor  = element_blank(),
+    plot.title        = element_text(color = "black", hjust = 0.5),
+    plot.caption      = element_text(
+      color = "black",
+      hjust = 0,
+      size = 10
+    )
+  ) +
+  labs(
+    title = "Motif enrichment at CHD1 CUT&RUN peaks",
+    caption = "Figure legend: Motif enrichment among CHD1 CUT&RUN peaks. Each point represents an enriched motif within a peak group. Point size indicates enrichment strength as -log10(E-value), with larger points representing lower E-values and stronger motif enrichment. Point colour indicates statistical significance as -log10(p-value), with darker purple representing more significant enrichment."
+  )
+print(p_wt)
+
+ggsave("AME_bubble_plot_WT_DMSO.pdf",
+       p_wt, width = 3, height = 4, device = "pdf")
+
+
+ame_data <- ame_data %>%
+  mutate(
+    frac_TP = TP / pos,
+    frac_FP = FP / neg,
+    fold_enrichment = frac_TP / frac_FP,
+    odds_ratio = (TP * (neg - FP)) / (FP * (pos - TP))
+  )
+print(ame_data)
+```
+
